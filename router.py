@@ -1,33 +1,51 @@
 #!/usr/bin/env python3
 """
 Router - Named Networks Framework
-Uses Communication, Parsing, Processing, and Routing modules
-Routes packets between Clients and Storage Nodes
+Hub-and-spoke topology with GUI debugging support
+Enhanced packet visualization and logging
 """
 
 import time
 import threading
+import sys
 from communication_module import CommunicationModule
 from parsing_module import ParsingModule
 from processing_module import ProcessingModule
 from routing_module import RoutingModule
 from common import ContentStore, PendingInterestTable
 
+# Import GUI if available
+try:
+    from debug_gui import DebugGUI
+    GUI_AVAILABLE = True
+except ImportError:
+    GUI_AVAILABLE = False
+    print("Warning: debug_gui.py not found. Running without GUI.")
+
+
 class Router:
     """
-    Router implementing core Named Networks functionality
-    Routes between Clients and Storage Nodes
+    Router implementing hub-and-spoke topology
+    Central hub connecting Client, Server, and Storage nodes
     """
     
-    def __init__(self, router_id: str, host: str = "127.0.0.1", port: int = 8001):
+    def __init__(self, router_id: str, host: str = "127.0.0.1", port: int = 8001, use_gui: bool = True):
         self.router_id = router_id
         self.node_name = f"Router-{router_id}"
         self.host = host
         self.port = port
         
-        print(f"[{self.node_name}] Initializing Router...")
+        # Initialize GUI if requested and available
+        self.gui = None
+        if use_gui and GUI_AVAILABLE:
+            self.gui = DebugGUI(self.node_name)
+            gui_thread = threading.Thread(target=self._init_gui, daemon=True)
+            gui_thread.start()
+            time.sleep(0.5)  # Give GUI time to initialize
         
-        # Initialize core modules (no Security module yet)
+        self._log(f"Initializing Router...")
+        
+        # Initialize core modules (WITHOUT gui parameter for compatibility)
         self.comm_module = CommunicationModule(self.node_name, host, port)
         self.parsing_module = ParsingModule(self.node_name)
         self.processing_module = ProcessingModule(self.node_name)
@@ -38,110 +56,187 @@ class Router:
             "packets_routed": 0,
             "clients_served": 0,
             "storage_requests": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
             "uptime_start": time.time()
         }
         
         # Set up module interfaces
         self._setup_module_interfaces()
         
-        print(f"[{self.node_name}] Router initialized successfully")
+        # Add default routes for hub-and-spoke topology
+        self._setup_hub_spoke_routes()
+        
+        self._log(f"Router initialized successfully", "data")
+    
+    def _init_gui(self):
+        """Initialize GUI in separate thread"""
+        if self.gui:
+            self.gui.initialize()
+            self.gui.run()
     
     def _setup_module_interfaces(self):
         """Setup interfaces between modules"""
-        print(f"[{self.node_name}] Setting up module interfaces...")
+        self._log(f"Setting up module interfaces...")
         
         # Communication -> Parsing
         self.comm_module.set_packet_handler(self.parsing_module.handle_packet)
         
-        # Parsing -> Processing
-        self.parsing_module.set_processing_handler(self._handle_processed_packet)
+        # Parsing -> Processing (Router handles this directly)
+        self.parsing_module.set_processing_handler(self._handle_parsed_packet)
         
-        # Processing doesn't connect to Security/Storage modules yet
-        # Instead, we'll handle routing directly in this router
+        # Router handles routing directly, no need to connect Processing to Routing
         
-        print(f"[{self.node_name}] Module interfaces configured")
+        self._log(f"Module interfaces configured")
     
-    def _handle_processed_packet(self, packet, source: str, packet_type: str):
-        """
-        Handle packets from Processing Module
-        Route to appropriate destination
-        """
-        try:
-            if packet_type == "interest":
-                return self._route_interest_packet(packet, source)
-            elif packet_type == "data":
-                return self._route_data_packet(packet, source)
-            else:
-                print(f"[{self.node_name}] Unknown packet type: {packet_type}")
-                return self._create_error_response("Unknown packet type")
-                
-        except Exception as e:
-            print(f"[{self.node_name}] Error handling processed packet: {e}")
-            return self._create_error_response("Routing error")
+    def _setup_hub_spoke_routes(self):
+        """Setup routes for hub-and-spoke topology"""
+        self._log("Setting up hub-and-spoke routing table...")
+        
+        # Default routes (will be updated when nodes connect)
+        # add_route(prefix, next_hop, interface, hop_count)
+        self.routing_module.add_route("/server", "127.0.0.1:7001", "eth0", 1)
+        self.routing_module.add_route("/storage", "127.0.0.1:9001", "eth0", 1)
+        self.routing_module.add_route("/admin", "127.0.0.1:7001", "eth0", 1)
+        
+        self._log_control("=== Initial FIB Table ===")
+        self.routing_module.show_fib()
     
-    def _route_interest_packet(self, interest, source: str):
-        """Route Interest packet based on content name"""
+    def _handle_parsed_packet(self, packet_obj, source: str, packet_type: str):
+        """
+        Handle parsed packet from Parsing Module
+        Routes to appropriate destination
+        """
+        from common import InterestPacket, DataPacket
+        
+        if packet_type == "interest":
+            return self._route_interest_packet(packet_obj, source)
+        elif packet_type == "data":
+            return self._route_data_packet(packet_obj, source)
+        else:
+            self._log_debug(f"❌ Unknown packet type: {packet_type}", "error")
+            return None
+    
+    def _route_interest_packet(self, interest: 'InterestPacket', source: str):
+        """Route Interest packet through the network"""
+        self._log_debug(
+            f"📨 INTEREST packet: {interest.name}",
+            "interest"
+        )
+        self._log_debug(f"  Operation: {interest.operation}", "content")
+        self._log_debug(f"  User: {interest.user_id}", "content")
+        self._log_debug(f"  Nonce: {interest.nonce}", "content")
+        self._log_debug(f"  From: {source}", "content")
+        
         self.stats["packets_routed"] += 1
         
-        print(f"[{self.node_name}] Routing Interest: {interest.name}")
+        # Step 1: Check Content Store (cache)
+        cached_data = self.processing_module.content_store.get(interest.name)
+        if cached_data:
+            self.stats["cache_hits"] += 1
+            self._log_debug(f"✓ Cache HIT: {interest.name}", "data")
+            self._log_control(f"[CACHE HIT] {interest.name} ({len(cached_data)} bytes)")
+            
+            return self._create_data_response(interest.name, cached_data)
         
-        # Check local Content Store first
-        cached_content = self.processing_module.content_store.get(interest.name)
-        if cached_content:
-            print(f"[{self.node_name}] Content Store HIT: {interest.name}")
-            return self._create_data_response(interest.name, cached_content)
+        self.stats["cache_misses"] += 1
+        self._log_debug(f"✗ Cache MISS: {interest.name}", "content")
         
-        print(f"[{self.node_name}] Content Store MISS: {interest.name}")
+        # Step 2: Add to PIT
+        self.processing_module.pit.add_entry(interest.name, source)
+        self._log_control(f"[PIT] Added entry: {interest.name} from {source}")
         
-        # Use routing module to find next hop
+        # Step 3: Lookup route in FIB
         routing_info = self.routing_module.get_routing_info(interest.name)
         
         if routing_info:
             next_hop, interface = routing_info
-            print(f"[{self.node_name}] Forwarding to {next_hop} via {interface}")
+            self._log_debug(f"→ Forwarding to {next_hop} via {interface}", "content")
+            self._log_control(f"[FIB LOOKUP] {interest.name} → {next_hop}")
             
-            # For now, simulate forwarding by generating response
-            # In real implementation, would forward to actual storage node
-            response_content = self._simulate_storage_response(interest)
+            # For hub-and-spoke: forward to actual storage node
+            self._log_debug(f"→ Forwarding to {next_hop} via {interface}", "content")
+            self._log_control(f"[FIB LOOKUP] {interest.name} → {next_hop}")
             
-            # Cache the response
-            content_bytes = response_content.encode('utf-8')
-            self.processing_module.content_store.put(interest.name, content_bytes)
+            # Forward to actual storage node
+            response_content = self._forward_to_storage(interest, next_hop)
             
-            self.stats["storage_requests"] += 1
-            return self._create_data_response(interest.name, content_bytes)
+            if response_content:
+                # Cache the response
+                content_bytes = response_content.encode('utf-8') if isinstance(response_content, str) else response_content
+                self.processing_module.content_store.put(interest.name, content_bytes)
+                self._log_control(f"[CACHE] Stored: {interest.name} ({len(content_bytes)} bytes)")
+                
+                self.stats["storage_requests"] += 1
+                return response_content
+            else:
+                return self._create_error_response("Storage node not responding")
         else:
-            print(f"[{self.node_name}] No route found for {interest.name}")
+            self._log_debug(f"❌ No route found for {interest.name}", "error")
+            return self._create_error_response("No route to destination")
+    
+    def _forward_to_storage(self, interest, next_hop):
+        """Forward Interest to actual storage node"""
+        try:
+            # Parse host:port
+            host, port = next_hop.split(':')
+            port = int(port)
+            
+            self._log_debug(f"📤 Forwarding Interest to {host}:{port}", "interest")
+            
+            # Send Interest to storage node
+            response = self.comm_module.send_packet_sync(host, port, interest.to_json())
+            
+            if response:
+                self._log_debug(f"📥 Received response from storage node", "data")
+                return response
+            else:
+                self._log_debug(f"⏱️ Storage node timeout", "error")
+                return None
+                
+        except Exception as e:
+            self._log_debug(f"❌ Forward error: {e}", "error")
+            return None
+        else:
+            self._log_debug(f"❌ No route found for {interest.name}", "error")
             return self._create_error_response("No route to destination")
     
     def _route_data_packet(self, data_packet, source: str):
         """Route Data packet back to requester"""
-        print(f"[{self.node_name}] Routing Data packet: {data_packet.name}")
+        self._log_debug(f"📦 DATA packet: {data_packet.name}", "data")
+        self._log_debug(f"  Length: {data_packet.data_length} bytes", "content")
+        self._log_debug(f"  Checksum: {data_packet.checksum}", "content")
+        
+        # Show payload preview
+        try:
+            payload_preview = data_packet.data_payload.decode('utf-8', errors='ignore')[:100]
+            self._log_debug(f"  Payload: {payload_preview}...", "payload")
+        except:
+            self._log_debug(f"  Payload: [Binary data]", "payload")
         
         # Cache the data packet
         self.processing_module.content_store.put(data_packet.name, data_packet.data_payload)
+        self._log_control(f"[CACHE] Stored: {data_packet.name}")
         
-        # In real implementation, would forward to requesting client
         return "ACK"
     
     def _simulate_storage_response(self, interest):
-        """
-        Simulate storage node response
-        In real implementation, this would forward to actual storage nodes
-        """
+        """Simulate storage node response (temporary for hub-spoke testing)"""
         content_templates = {
             "READ": f"Content for {interest.name} requested by {interest.user_id}",
             "WRITE": f"Write operation acknowledged for {interest.name}",
-            "PERMISSION": f"Permission operation for {interest.name}"
+            "PERMISSION": f"Permission granted for {interest.user_id} on {interest.name}"
         }
         
-        # Special responses for known paths
+        # Special test responses
         if "/dlsu/hello" in interest.name:
-            return "Hello from DLSU Named Networks Router!"
-        elif "/dlsu/public" in interest.name:
-            return "Public content accessible to all users"
-        elif "/dlsu/storage" in interest.name:
-            return f"Storage content from {interest.name}"
+            return "Hello from DLSU Named Networks Router! Your hub-and-spoke topology is working!"
+        elif "/dlsu/goks" in interest.name:
+            return "Welcome to DLSU Goks community network!"
+        elif "/storage" in interest.name:
+            return f"Storage content from {interest.name} (RAID 0 configuration)"
+        elif "/server" in interest.name:
+            return f"Server response for {interest.name}"
         else:
             return content_templates.get(interest.operation, f"Response for {interest.name}")
     
@@ -158,6 +253,9 @@ class Router:
             data_length=len(content),
             checksum=calculate_checksum(content.decode('utf-8', errors='ignore'))
         )
+        
+        self._log_debug(f"✉️  Created DATA response for {name}", "data")
+        
         return data_packet.to_json()
     
     def _create_error_response(self, error_message: str) -> str:
@@ -170,27 +268,35 @@ class Router:
             data_length=len(error_message),
             checksum="error"
         )
+        
+        self._log_debug(f"⚠️  Created ERROR response: {error_message}", "error")
+        
         return data_packet.to_json()
+    
+    def add_route(self, prefix: str, next_hop: str):
+        """Add route to FIB"""
+        self.routing_module.add_route(prefix, next_hop, "eth0", 1)
+        self._log_control(f"[FIB] Added route: {prefix} → {next_hop}")
     
     def start(self):
         """Start the router"""
-        print(f"[{self.node_name}] Starting router...")
+        self._log(f"Starting router...", "interest")
         
         # Start communication module
         self.comm_module.start()
         
-        # Add some test content
+        # Add test content
         self._add_test_content()
         
-        print(f"[{self.node_name}] Router started on {self.host}:{self.port}")
-        print(f"[{self.node_name}] Ready to route Named Networks traffic")
+        self._log(f"Router started on {self.host}:{self.port} (UDP)", "data")
+        self._log(f"Ready to route Named Networks traffic", "data")
         
-        # Show routing table
-        self.routing_module.show_fib()
+        # Show initial configuration
+        self.show_configuration()
     
     def stop(self):
         """Stop the router"""
-        print(f"[{self.node_name}] Stopping router...")
+        self._log(f"Stopping router...")
         
         # Stop communication module
         self.comm_module.stop()
@@ -198,100 +304,137 @@ class Router:
         # Show final statistics
         self.show_comprehensive_stats()
         
-        print(f"[{self.node_name}] Router stopped")
+        self._log(f"Router stopped")
     
     def _add_test_content(self):
-        """Add test content for caching demonstration"""
+        """Add test content for demonstration"""
         test_content = {
             "/dlsu/hello": b"Hello from DLSU Named Networks!",
-            "/dlsu/public/info": b"Public information for all users",
-            "/dlsu/test/cached": b"This content was pre-cached for testing"
+            "/dlsu/public/info": b"Public information accessible to all users",
+            "/test/sample": b"Sample test data for validation"
         }
         
         for name, content in test_content.items():
             self.processing_module.content_store.put(name, content)
         
-        print(f"[{self.node_name}] Added {len(test_content)} test content items")
+        self._log_control(f"[CACHE] Pre-loaded {len(test_content)} test entries")
     
-    def add_route(self, prefix: str, next_hop: str, interface: str = "eth0"):
-        """Add a new route to the routing table"""
-        self.routing_module.add_route(prefix, next_hop, interface)
+    def show_configuration(self):
+        """Display router configuration"""
+        self._log_control("=" * 50)
+        self._log_control(f"ROUTER CONFIGURATION: {self.node_name}")
+        self._log_control("=" * 50)
+        self._log_control(f"Network: {self.host}:{self.port} (UDP)")
+        self._log_control(f"Topology: Hub-and-Spoke")
+        self._log_control(f"Modules: Communication, Parsing, Processing, Routing")
+        self._log_control("=" * 50)
+        
+        # Show FIB
+        self.routing_module.show_fib()
+        
+        # Show initial cache
+        self._show_cache_contents()
     
     def show_comprehensive_stats(self):
-        """Display statistics from all modules"""
-        print(f"\n=== {self.node_name} Comprehensive Statistics ===")
-        
-        # Router-level stats
+        """Display comprehensive statistics"""
         uptime = time.time() - self.stats['uptime_start']
-        print(f"Router Uptime: {uptime:.1f} seconds")
-        print(f"Packets Routed: {self.stats['packets_routed']}")
-        print(f"Clients Served: {self.stats['clients_served']}")
+        
+        self._log_control("=" * 50)
+        self._log_control(f"ROUTER STATISTICS: {self.node_name}")
+        self._log_control("=" * 50)
+        self._log_control(f"Uptime: {uptime:.2f} seconds")
+        self._log_control(f"Packets Routed: {self.stats['packets_routed']}")
+        self._log_control(f"Cache Hits: {self.stats['cache_hits']}")
+        self._log_control(f"Cache Misses: {self.stats['cache_misses']}")
+        
+        if self.stats['cache_hits'] + self.stats['cache_misses'] > 0:
+            hit_rate = (self.stats['cache_hits'] / 
+                       (self.stats['cache_hits'] + self.stats['cache_misses'])) * 100
+            self._log_control(f"Cache Hit Rate: {hit_rate:.1f}%")
+        
         print(f"Storage Requests: {self.stats['storage_requests']}")
         
-        print("\n" + "="*60)
+        # Communication stats (create stub since method doesn't exist)
+        try:
+            comm_stats = self.comm_module.get_stats()
+        except AttributeError:
+            comm_stats = {"packets_received": "N/A", "packets_sent": "N/A", "errors": "N/A"}
         
-        # Module statistics
-        print("COMMUNICATION MODULE:")
-        buffer_status = self.comm_module.get_buffer_status()
-        print(f"  Receive Buffer: {buffer_status['receive_buffer_size']}/100")
-        print(f"  Send Buffer: {buffer_status['send_buffer_size']}/100")
-        
-        print("\nPROCESSING MODULE:")
-        processing_stats = self.processing_module.get_processing_stats()
-        print(f"  Interests Processed: {processing_stats['total_interests_processed']}")
-        print(f"  Cache Hits: {processing_stats['cache_hits']}")
-        print(f"  Cache Misses: {processing_stats['cache_misses']}")
-        print(f"  Cache Hit Ratio: {processing_stats['cache_hit_ratio']:.1%}")
-        
-        print("\nROUTING MODULE:")
-        self.routing_module.show_stats()
-        
-        print("\n" + "="*60)
-    
-    def interactive_commands(self):
-        """Interactive command interface for router management"""
-        print("\nAvailable commands:")
-        print("  'stats' - Show comprehensive statistics")
-        print("  'fib' - Show Forwarding Information Base")
-        print("  'cache' - Show Content Store contents")
-        print("  'route <prefix> <next_hop>' - Add new route")
-        print("  'quit' - Stop router")
-        
-        while True:
-            try:
-                command = input(f"{self.router_id}> ").strip()
-                
-                if command.lower() in ['quit', 'exit', 'q']:
-                    break
-                elif command.lower() == 'stats':
-                    self.show_comprehensive_stats()
-                elif command.lower() == 'fib':
-                    self.routing_module.show_fib()
-                elif command.lower() == 'cache':
-                    self._show_cache_contents()
-                elif command.lower().startswith('route'):
-                    self._handle_route_command(command)
-                elif command.lower() == 'help':
-                    print("Available commands: stats, fib, cache, route, quit")
-                elif command == '':
-                    continue
-                else:
-                    print(f"Unknown command: {command}")
-                    
-            except KeyboardInterrupt:
-                break
+        self._log_control(f"Packets RX: {comm_stats['packets_received']}")
+        self._log_control(f"Packets TX: {comm_stats['packets_sent']}")
+        self._log_control(f"Errors: {comm_stats['errors']}")
+        self._log_control("=" * 50)
     
     def _show_cache_contents(self):
         """Show Content Store contents"""
-        print(f"\n=== {self.node_name} Content Store ===")
+        self._log_control("=== Content Store ===")
         store = self.processing_module.content_store.store
         if not store:
-            print("Content Store is empty")
+            self._log_control("  (empty)")
         else:
             for name, content in store.items():
-                content_preview = content[:50] if len(content) > 50 else content
-                print(f"{name}: {content_preview}...")
-        print("=" * 50)
+                size = len(content)
+                self._log_control(f"  {name} ({size} bytes)")
+        self._log_control("=" * 20)
+    
+    def _log(self, message: str, log_type: str = "normal"):
+        """Internal logging"""
+        print(f"[{self.node_name}] {message}")
+    
+    def _log_control(self, message: str):
+        """Log to control panel"""
+        if self.gui:
+            self.gui.log_control(message)
+        else:
+            print(f"[{self.node_name}][CONTROL] {message}")
+    
+    def _log_debug(self, message: str, msg_type: str = "normal"):
+        """Log to debug panel"""
+        if self.gui:
+            self.gui.log_debug(message, msg_type)
+        else:
+            print(f"[{self.node_name}][DEBUG] {message}")
+    
+    def interactive_commands(self):
+        """Interactive command interface"""
+        print("\nRouter Management Commands:")
+        print("  show cache  - Display Content Store contents")
+        print("  show fib    - Display FIB routing table")
+        print("  show pit    - Display PIT table")
+        print("  show stats  - Display statistics")
+        print("  route <prefix> <nexthop> - Add route")
+        print("  quit        - Stop router")
+        print()
+        
+        while True:
+            try:
+                command = input(f"{self.node_name}> ").strip().lower()
+                
+                if command == "quit" or command == "exit":
+                    break
+                elif command == "show cache":
+                    self._show_cache_contents()
+                elif command == "show fib":
+                    self.routing_module.show_fib()
+                elif command == "show pit":
+                    # Simple PIT display since show() method doesn't exist
+                    pit_table = self.processing_module.pit.table
+                    if not pit_table:
+                        print("PIT is empty")
+                    else:
+                        print("=== PIT Table ===")
+                        for name, faces in pit_table.items():
+                            print(f"{name}: {faces}")
+                        print("=" * 20)
+                elif command == "show stats":
+                    self.show_comprehensive_stats()
+                elif command.startswith("route"):
+                    self._handle_route_command(command)
+                elif command:
+                    print(f"Unknown command: {command}")
+                    
+            except (KeyboardInterrupt, EOFError):
+                break
     
     def _handle_route_command(self, command):
         """Handle route addition command"""
@@ -308,36 +451,39 @@ class Router:
         """Get the actual port being used"""
         return self.comm_module.get_port()
 
+
 def main():
     """Run the router"""
-    import sys
-    
-    # Get router ID from command line
     router_id = sys.argv[1] if len(sys.argv) > 1 else "R1"
     
-    # Create router
-    router = Router(router_id)
+    print("="*70)
+    print("NAMED NETWORKS ROUTER - HUB-AND-SPOKE TOPOLOGY")
+    print("="*70)
+    
+    # Create router with GUI
+    router = Router(router_id, use_gui=True)
     
     try:
         router.start()
         
-        print("\n" + "="*70)
-        print("NAMED NETWORKS ROUTER")
-        print("="*70)
-        print("Router is running with Communication, Parsing, Processing, and Routing modules.")
-        print("Test with:")
+        print("\n✓ Router is running with debugging GUI")
+        print("  - Check GUI window for real-time packet visualization")
+        print("  - Interest packets shown in RED")
+        print("  - Data packets shown in BLUE")
+        print("\nTest with:")
         print("  python simple_client.py Alice")
         print("  python simple_client.py Bob")
-        print("\nRouter management interface available.")
-        print("="*70 + "\n")
+        print("\n" + "="*70 + "\n")
         
-        # Start interactive command interface
+        # Interactive command interface
         router.interactive_commands()
         
     except KeyboardInterrupt:
-        print("\nShutting down router...")
+        print("\n\nShutting down router...")
     finally:
         router.stop()
+        print("Router stopped. Goodbye!")
+
 
 if __name__ == "__main__":
     main()
