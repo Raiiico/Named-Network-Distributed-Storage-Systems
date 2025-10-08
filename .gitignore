@@ -14,3 +14,13 @@ __pycache__/common.cpython-312.pyc
 __pycache__/communication_module.cpython-312.pyc
 __pycache__/parsing_module.cpython-312.pyc
 test.txt
+storage/node001/fragment_0
+storage/node001/fragment_parity2_0
+storage/node002/fragment_0
+storage/node003/fragment_0
+storage/node003/fragment_parity1_0
+storage/node004/fragment_0
+storage/node004/fragment_parity_0
+storage/node005/fragment_0
+__pycache__/common.cpython-312.pyc
+__pycache__/communication_module.cpython-312.pyc
