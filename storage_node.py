@@ -9,9 +9,13 @@ import sys
 import time
 import os
 import hashlib
+import threading
+import json
 from communication_module import CommunicationModule
 from parsing_module import ParsingModule
 from common import InterestPacket, DataPacket, calculate_checksum
+
+from storage_module import StorageModule
 
 class SimpleStorageNode:
     """
@@ -32,10 +36,15 @@ class SimpleStorageNode:
         
         # Initialize modules
         self.comm_module = CommunicationModule(self.node_name, host, port)
-        self.parsing_module = ParsingModule(self.node_name)
-        
+        self.parsing_module = ParsingModule(self.node_name)      
+        # Initialize Storage Module with RAID
+        self.storage_module = StorageModule(self.node_name, raid_level, self.storage_path)
+    
         # Storage data
         self.stored_files = {}
+        # Fragment accumulator: base_name -> { index: bytes }
+        self.fragment_accumulator = {}
+        self._fragment_lock = threading.Lock()
         
         # Statistics
         self.stats = {
@@ -70,8 +79,151 @@ class SimpleStorageNode:
         """Handle storage requests from router"""
         if packet_type == "interest":
             return self._handle_interest(packet_obj, source)
+        elif packet_type == "data":
+            return self._handle_data_packet(packet_obj, source)
         else:
             return self._create_error_response("Unsupported packet type")
+
+    def _handle_data_packet(self, data_packet: DataPacket, source: str):
+        """Handle incoming DataPacket uploads (persist file bytes)."""
+        try:
+            file_name = data_packet.name
+            content_bytes = data_packet.data_payload
+            uploader = None
+
+            # Try to detect JSON-wrapped uploader + base64 payload
+            try:
+                decoded = content_bytes.decode('utf-8')
+                import json, base64
+                parsed = json.loads(decoded)
+                if isinstance(parsed, dict) and 'uploader' in parsed and 'data_b64' in parsed:
+                    uploader = parsed.get('uploader')
+                    content_bytes = base64.b64decode(parsed.get('data_b64'))
+            except Exception:
+                # Not a wrapped payload, treat as raw bytes
+                pass
+
+            # Detect fragment notation (e.g., /path/file:[1/3])
+            try:
+                from common import parse_fragment_notation, validate_content_name
+                frag_info = parse_fragment_notation(file_name)
+            except Exception:
+                frag_info = None
+
+            # If fragment, accumulate in memory until all parts received
+            if frag_info and frag_info.get("is_fragment"):
+                base_name = frag_info["base_name"]
+                index = int(frag_info["index"])  # 1-based index expected from client
+                total = int(frag_info["total"])
+
+                with self._fragment_lock:
+                    if base_name not in self.fragment_accumulator:
+                        self.fragment_accumulator[base_name] = {}
+
+                    self.fragment_accumulator[base_name][index] = content_bytes
+
+                    # Check if we have all fragments
+                    parts = self.fragment_accumulator[base_name]
+                    if len(parts) >= total:
+                        # Reassemble in order
+                        assembled = b"".join(parts[i] for i in sorted(parts.keys()))
+
+                        # Persist assembled file
+                        storage_resp = self.storage_module.store_file(base_name, assembled)
+
+                        # Clean up accumulator
+                        del self.fragment_accumulator[base_name]
+
+                        if storage_resp.success:
+                            self.stored_files[base_name] = {
+                                "content": assembled,
+                                "stored_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+                                "checksum": storage_resp.metadata.checksum if storage_resp.metadata else "",
+                                "size": len(assembled),
+                                "user": uploader if uploader else "uploader",
+                                "raid_processed": True
+                            }
+                            self.stats["files_stored"] += 1
+                            self.stats["bytes_stored"] += len(assembled)
+
+                            # Write metadata JSON so stored files are discoverable on disk
+                            try:
+                                stored_path = storage_resp.metadata.file_path if storage_resp.metadata and hasattr(storage_resp.metadata, 'file_path') else ''
+                                safe_name = os.path.basename(stored_path) if stored_path else base_name.replace('/', '_')
+                                meta_dir = os.path.join(self.storage_path, 'metadata')
+                                os.makedirs(meta_dir, exist_ok=True)
+                                meta_path = os.path.join(meta_dir, f"{safe_name}.json")
+                                meta = {
+                                    "original_name": base_name,
+                                    "stored_path": stored_path,
+                                    "checksum": storage_resp.metadata.checksum if storage_resp.metadata else "",
+                                    "size": len(assembled),
+                                    "stored_at": time.strftime('%Y-%m-%d %H:%M:%S')
+                                }
+                                with open(meta_path, 'w', encoding='utf-8') as mf:
+                                    json.dump(meta, mf, indent=2)
+                            except Exception as e:
+                                print(f"[{self.node_name}] Warning: could not write metadata file: {e}")
+
+                            resp_msg = f"STORED:{base_name}"
+                            return self._create_data_response(base_name, resp_msg)
+                        else:
+                            return self._create_error_response(storage_resp.error or "Store failed")
+
+                    # Not all fragments yet
+                    return self._create_data_response(file_name, f"FRAGMENT_RECEIVED:{index}/{total}")
+
+            # Non-fragment: validate name (best-effort)
+            try:
+                from common import validate_content_name
+                if not validate_content_name(file_name):
+                    return self._create_error_response(f"Invalid content name: {file_name}")
+            except Exception:
+                pass
+
+            # Persist using StorageModule
+            storage_resp = self.storage_module.store_file(file_name, content_bytes)
+
+            if storage_resp.success:
+                # Keep lightweight in-memory index
+                self.stored_files[file_name] = {
+                    "content": content_bytes,
+                    "stored_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+                    "checksum": storage_resp.metadata.checksum if storage_resp.metadata else "",
+                    "size": len(content_bytes),
+                    "user": uploader if uploader else "uploader"
+                }
+
+                self.stats["files_stored"] += 1
+                self.stats["bytes_stored"] += len(content_bytes)
+
+                # Write metadata JSON so stored files are discoverable on disk
+                try:
+                    stored_path = storage_resp.metadata.file_path if storage_resp.metadata and hasattr(storage_resp.metadata, 'file_path') else ''
+                    safe_name = os.path.basename(stored_path) if stored_path else file_name.replace('/', '_')
+                    meta_dir = os.path.join(self.storage_path, 'metadata')
+                    os.makedirs(meta_dir, exist_ok=True)
+                    meta_path = os.path.join(meta_dir, f"{safe_name}.json")
+                    meta = {
+                        "original_name": file_name,
+                        "stored_path": stored_path,
+                        "checksum": storage_resp.metadata.checksum if storage_resp.metadata else "",
+                        "size": len(content_bytes),
+                        "stored_at": time.strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                    with open(meta_path, 'w', encoding='utf-8') as mf:
+                        json.dump(meta, mf, indent=2)
+                except Exception as e:
+                    print(f"[{self.node_name}] Warning: could not write metadata file: {e}")
+
+                resp_msg = f"STORED:{file_name}"
+                return self._create_data_response(file_name, resp_msg)
+            else:
+                return self._create_error_response(storage_resp.error or "Store failed")
+
+        except Exception as e:
+            print(f"[{self.node_name}] Error storing uploaded data: {e}")
+            return self._create_error_response(f"Upload error: {e}")
     
     def _handle_interest(self, interest: InterestPacket, source: str):
         """Handle Interest packets for storage operations"""
@@ -86,7 +238,7 @@ class SimpleStorageNode:
         
         try:
             if interest.operation == "READ":
-                return self._handle_read_request(interest)
+                return self._handle_read_request(interest, source)
             elif interest.operation == "WRITE":
                 return self._handle_write_request(interest)
             elif interest.operation == "PERMISSION":
@@ -98,84 +250,167 @@ class SimpleStorageNode:
             print(f"[{self.node_name}] Error handling request: {e}")
             return self._create_error_response(f"Storage error: {str(e)}")
     
-    def _handle_read_request(self, interest: InterestPacket):
-        """Handle READ requests"""
+    def _handle_read_request(self, interest: InterestPacket, source: str):
+        """Handle READ requests using Storage Module. If the content is larger
+        than the configured fragment size, split into fragments and send them
+        back to the requester. The first fragment is returned synchronously; the
+        remaining fragments are sent asynchronously via `comm_module.send`.
+        """
         file_name = interest.name
-        
-        # Check if file exists in storage
-        if file_name in self.stored_files:
+
+        print(f"\n[{self.node_name}] === READ REQUEST ===")
+        print(f"[{self.node_name}] File: {file_name}")
+
+        # Try Storage Module first (RAID-processed files)
+        storage_response = self.storage_module.retrieve_file(file_name)
+
+        if storage_response.success:
+            self.stats["files_retrieved"] += 1
+
+            content_bytes = storage_response.content
+            total_size = len(content_bytes)
+
+            print(f"[{self.node_name}] ✓ Retrieved from RAID {self.raid_level} storage")
+            print(f"[{self.node_name}] Size: {total_size} bytes")
+
+            # Decide whether to fragment the response
+            frag_size = getattr(self.storage_module, 'fragment_size', 4096)
+            if total_size > frag_size:
+                # Create fragments
+                fragments = [content_bytes[i:i + frag_size] for i in range(0, total_size, frag_size)]
+                total = len(fragments)
+
+                print(f"[{self.node_name}] Sending {total} fragments (frag_size={frag_size}) to {source}")
+
+                # Parse source address (expected format 'host:port')
+                try:
+                    host, port_s = source.split(":")
+                    dest_port = int(port_s)
+                except Exception:
+                    # Fallback: if parsing fails, don't attempt async sends
+                    host = None
+                    dest_port = None
+
+                # Prepare DataPackets for each fragment
+                first_pkt_json = None
+                for idx, chunk in enumerate(fragments, start=1):
+                    frag_name = f"{file_name}:[{idx}/{total}]"
+                    pkt = DataPacket(name=frag_name, data_payload=chunk, data_length=len(chunk))
+                    pkt_json = pkt.to_json()
+
+                    if idx == 1:
+                        # Return first fragment synchronously
+                        first_pkt_json = pkt_json
+                    else:
+                        # Send remaining fragments asynchronously if we have a valid host/port
+                        if host and dest_port:
+                            try:
+                                self.comm_module.send(pkt_json, host, dest_port)
+                            except Exception as e:
+                                print(f"[{self.node_name}][COMM] Failed to send fragment {idx}/{total} to {host}:{dest_port}: {e}")
+
+                # Return first fragment (guaranteed to exist)
+                return first_pkt_json
+
+            else:
+                # Not large: return in a single packet
+                return self._create_data_response(file_name, content_bytes)
+
+        # Fallback to in-memory (for pre-loaded test files)
+        elif file_name in self.stored_files:
             file_data = self.stored_files[file_name]
             self.stats["files_retrieved"] += 1
-            
-            print(f"[{self.node_name}] ✓ File found: {file_name}")
-            print(f"[{self.node_name}] Size: {len(file_data['content'])} bytes")
-            print(f"[{self.node_name}] RAID: {self.raid_level}")
-            
-            # Create response with file content
-            response_content = f"""RAID {self.raid_level} Storage Response:
-File: {file_name}
-Content: {file_data['content'].decode('utf-8', errors='ignore')}
-Stored: {file_data['stored_at']}
-Checksum: {file_data['checksum']}
-Storage Node: {self.node_name}"""
-            
-            return self._create_data_response(file_name, response_content)
-        
+
+            print(f"[{self.node_name}] ✓ Retrieved from memory (test file)")
+
+            content_bytes = file_data['content']
+            total_size = len(content_bytes)
+            frag_size = getattr(self.storage_module, 'fragment_size', 4096)
+
+            if total_size > frag_size:
+                # Fragment and send similarly to RAID branch
+                fragments = [content_bytes[i:i + frag_size] for i in range(0, total_size, frag_size)]
+                total = len(fragments)
+                print(f"[{self.node_name}] Sending {total} fragments (memory file) to {source}")
+
+                try:
+                    host, port_s = source.split(":")
+                    dest_port = int(port_s)
+                except Exception:
+                    host = None
+                    dest_port = None
+
+                first_pkt_json = None
+                for idx, chunk in enumerate(fragments, start=1):
+                    frag_name = f"{file_name}:[{idx}/{total}]"
+                    pkt = DataPacket(name=frag_name, data_payload=chunk, data_length=len(chunk))
+                    pkt_json = pkt.to_json()
+
+                    if idx == 1:
+                        first_pkt_json = pkt_json
+                    else:
+                        if host and dest_port:
+                            try:
+                                self.comm_module.send(pkt_json, host, dest_port)
+                            except Exception as e:
+                                print(f"[{self.node_name}][COMM] Failed to send fragment {idx}/{total} to {host}:{dest_port}: {e}")
+
+                return first_pkt_json
+
+            else:
+                return self._create_data_response(file_name, content_bytes)
+
         else:
-            # File not found, but provide meaningful response
-            print(f"[{self.node_name}] ✗ File not found: {file_name}")
-            
-            response_content = f"""RAID {self.raid_level} Storage Response:
-File: {file_name}
-Status: Available for storage
-Storage Node: {self.node_name}
-RAID Level: {self.raid_level}
-Available Space: 1.2TB
-Files Stored: {len(self.stored_files)}"""
-            
-            return self._create_data_response(file_name, response_content)
-    
+            print(f"[{self.node_name}] ✗ File not found")
+            return self._create_error_response(f"File not found: {file_name}")
+        
+        
     def _handle_write_request(self, interest: InterestPacket):
-        """Handle WRITE requests with actual file content"""
+        """Handle WRITE requests using Storage Module"""
         file_name = interest.name
         
-        # For demo: simulate content (in real system, content would come in Interest payload)
+        # Generate content (in real system, comes from Interest payload)
         content = f"User {interest.user_id} wrote to {file_name} at {time.strftime('%Y-%m-%d %H:%M:%S')}"
         content_bytes = content.encode('utf-8')
         
-        # Write to actual file
-        safe_filename = file_name.replace('/', '_')
-        file_path = os.path.join(self.storage_path, f"{safe_filename}.txt")
-        
-        with open(file_path, 'w') as f:
-            f.write(content)
-        
-        # Store in memory
-        self.stored_files[file_name] = {
-            "content": content_bytes,
-            "file_path": file_path,  # Add file path
-            "stored_at": time.strftime('%Y-%m-%d %H:%M:%S'),
-            "checksum": hashlib.md5(content_bytes).hexdigest(),
-            "size": len(content_bytes),
-            "user": interest.user_id
-        }
-        
-        self.stats["files_stored"] += 1
-        self.stats["bytes_stored"] += len(content_bytes)
-        
-        print(f"[{self.node_name}] ✓ File stored: {file_name}")
+        print(f"\n[{self.node_name}] === WRITE REQUEST ===")
+        print(f"[{self.node_name}] File: {file_name}")
         print(f"[{self.node_name}] User: {interest.user_id}")
-        print(f"[{self.node_name}] RAID: {self.raid_level}")
+        print(f"[{self.node_name}] Size: {len(content_bytes)} bytes")
         
-        response_content = f"""RAID {self.raid_level} Write Confirmation:
+        # USE Storage Module for RAID processing
+        storage_response = self.storage_module.store_file(file_name, content_bytes)
+        
+        if storage_response.success:
+            # Also keep in memory for quick access
+            self.stored_files[file_name] = {
+                "content": content_bytes,
+                "stored_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+                "checksum": storage_response.metadata.checksum,
+                "size": len(content_bytes),
+                "user": interest.user_id,
+                "raid_processed": True
+            }
+            
+            self.stats["files_stored"] += 1
+            self.stats["bytes_stored"] += len(content_bytes)
+            
+            print(f"[{self.node_name}] ✓ RAID {self.raid_level} processing complete")
+            print(f"[{self.node_name}] Original: {storage_response.metadata.original_size} bytes")
+            print(f"[{self.node_name}] Stored: {storage_response.metadata.stored_size} bytes")
+            
+            response_content = f"""RAID {self.raid_level} Write Confirmation:
 File: {file_name}
-Status: Successfully stored
-Size: {len(content_bytes)} bytes
-RAID Level: {self.raid_level}
+Status: Successfully stored with RAID {self.raid_level}
+Original Size: {storage_response.metadata.original_size} bytes
+Stored Size: {storage_response.metadata.stored_size} bytes
 Storage Node: {self.node_name}
 User: {interest.user_id}"""
-        
-        return self._create_data_response(file_name, response_content)
+            
+            return self._create_data_response(file_name, response_content)
+        else:
+            print(f"[{self.node_name}] ✗ Storage error: {storage_response.error}")
+            return self._create_error_response(storage_response.error)
     
     def _handle_permission_request(self, interest: InterestPacket):
         """Handle PERMISSION requests"""
@@ -212,17 +447,26 @@ RAID Level: {self.raid_level}"""
         self.stats["files_stored"] = len(test_files)
         print(f"[{self.node_name}] Pre-loaded {len(test_files)} test files")
     
-    def _create_data_response(self, name: str, content: str):
-        """Create Data packet response"""
-        content_bytes = content.encode('utf-8')
-        
+    def _create_data_response(self, name: str, content):
+        """Create Data packet response. `content` may be `str` or `bytes`."""
+        # Accept bytes or string content without forcing a UTF-8 decode that
+        # would corrupt binary data. DataPacket.to_json() will base64-encode
+        # the payload for safe JSON transport.
+        if isinstance(content, bytes):
+            content_bytes = content
+            # calculate checksum using existing helper which expects str/bytes
+            checksum_src = content_bytes.decode('utf-8', errors='ignore')
+        else:
+            content_bytes = str(content).encode('utf-8')
+            checksum_src = str(content)
+
         data_packet = DataPacket(
             name=name,
             data_payload=content_bytes,
             data_length=len(content_bytes),
-            checksum=calculate_checksum(content)
+            checksum=calculate_checksum(checksum_src)
         )
-        
+
         return data_packet.to_json()
     
     def _create_error_response(self, error_message: str):
@@ -287,6 +531,7 @@ RAID Level: {self.raid_level}"""
         print("\nStorage Node Commands:")
         print("  show files   - List stored files")
         print("  show stats   - Display statistics")
+        print("  show raid    - Display RAID information")  # ADD 
         print("  store <name> - Store a test file")
         print("  quit         - Stop storage node")
         print()
@@ -301,6 +546,8 @@ RAID Level: {self.raid_level}"""
                     self._show_files()
                 elif command == "show stats":
                     self._show_stats()
+                elif command == "show raid":  # ADD 
+                    self._show_raid_info()
                 elif command.startswith("store"):
                     parts = command.split(maxsplit=1)
                     if len(parts) > 1:
@@ -314,6 +561,21 @@ RAID Level: {self.raid_level}"""
                     
             except (KeyboardInterrupt, EOFError):
                 break
+    
+    def _show_raid_info(self):
+        """Show RAID storage information"""
+        info = self.storage_module.get_storage_info()
+        
+        print(f"\n=== {self.node_name} RAID Information ===")
+        print(f"RAID Level: {info['raid_level']} ({info['raid_description']})")
+        print(f"Storage Path: {info['storage_path']}")
+        print(f"Files Stored: {info['files_stored']}")
+        print(f"Files Retrieved: {info['files_retrieved']}")
+        print(f"Total Files: {info['total_files']}")
+        print(f"Total Size: {info['total_size_bytes']} bytes")
+        print(f"RAID Operations: {info['raid_operations']}")
+        print(f"Parity Calculations: {info['parity_calculations']}")
+        print("=" * 50)
     
     def _show_files(self):
         """Show stored files"""

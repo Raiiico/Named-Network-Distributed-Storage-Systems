@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Parsing Module - Named Networks Framework
-Fixed checksum validation and error handling
+FIXED: Nonce validation removed
 """
 
 import json
@@ -12,7 +12,7 @@ from common import InterestPacket, DataPacket, PacketType, calculate_checksum
 class ParsingModule:
     """
     Parsing Module for Named Networks Framework
-    Fixed checksum validation to eliminate warnings
+    Fixed: No nonce validation
     """
     
     def __init__(self, node_name: str):
@@ -28,7 +28,7 @@ class ParsingModule:
             "validation_errors": 0
         }
         
-        print(f"[{self.node_name}][PARSING] Parsing Module initialized")
+        print(f"[{self.node_name}][PARSING] Parsing Module initialized (NO NONCE)")
     
     def set_processing_handler(self, handler: callable):
         """Set handler for processed packets"""
@@ -97,7 +97,7 @@ class ParsingModule:
                 self.stats["checksum_errors"] += 1
                 print(f"[{self.node_name}][PARSING] Note: Checksum recalculated for {interest_packet.name}")
                 # Recalculate checksum instead of failing
-                checksum_content = f"{interest_packet.name}|{interest_packet.user_id}|{interest_packet.operation}|{interest_packet.nonce}"
+                checksum_content = f"{interest_packet.name}|{interest_packet.user_id}|{interest_packet.operation}"
                 interest_packet.checksum = calculate_checksum(checksum_content)
             
             # Fragment support check
@@ -146,7 +146,7 @@ class ParsingModule:
             return self._create_error_response(f"Data parsing error: {str(e)}")
     
     def _validate_interest_packet(self, interest: InterestPacket) -> Dict[str, Any]:
-        """Validate Interest packet structure and content"""
+        """Validate Interest packet structure and content (NO NONCE CHECK)"""
         
         # Check required fields
         if not interest.name:
@@ -164,9 +164,7 @@ class ParsingModule:
         if interest.operation.upper() not in valid_operations:
             return {"valid": False, "error": f"Invalid operation: {interest.operation}"}
         
-        # Validate nonce
-        if interest.nonce <= 0:
-            return {"valid": False, "error": "Invalid nonce"}
+        # NO NONCE VALIDATION - REMOVED
         
         return {"valid": True}
     
@@ -242,7 +240,7 @@ class ParsingModule:
 
 # Test the parsing module
 if __name__ == "__main__":
-    print("Testing Parsing Module with fixed checksums...")
+    print("Testing Parsing Module (NO NONCE)...")
     
     # Create test parser
     parser = ParsingModule("TestParser")

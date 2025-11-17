@@ -6,6 +6,7 @@ Compatible with the fixed communication_module.py and common.py
 
 import time
 import sys
+import os
 from common import create_interest_packet, DataPacket, calculate_checksum
 from communication_module import CommunicationModule
 
@@ -47,7 +48,8 @@ class SimpleClient:
         print(f"  Name:      {interest.name}")
         print(f"  Operation: {interest.operation}")
         print(f"  User ID:   {interest.user_id}")
-        print(f"  Nonce:     {interest.nonce}")
+        # Nonce removed from protocol; print placeholder for clarity
+        print(f"  Nonce:     REMOVED")
         print(f"  Checksum:  {interest.checksum}")
         print(f"  Timestamp: {time.strftime('%H:%M:%S', time.localtime(send_time))}")
         print(f"{'='*70}")
@@ -215,6 +217,7 @@ class SimpleClient:
         print(f"  read <name>       - Send READ Interest")
         print(f"  write <name>      - Send WRITE Interest")
         print(f"  permission <name> - Send PERMISSION Interest")
+        print(f"  download <name> [dest_path] - Download content and save to disk")
         print(f"  concurrent        - Run concurrent test")
         print(f"  stats             - Show statistics")
         print(f"  quit              - Exit")
@@ -249,6 +252,28 @@ class SimpleClient:
                     name = parts[1]
                     operation = cmd.upper()
                     self.send_interest(name, operation, router_host, router_port)
+                elif cmd == "download":
+                    # download <name> [dest_path] [host] [port]
+                    args = parts[1].split() if len(parts) > 1 else []
+                    if len(args) < 1:
+                        print("Usage: download <name> [dest_path] [host] [port]")
+                        continue
+                    name = args[0]
+                    dest_path = args[1] if len(args) > 1 else None
+                    host = args[2] if len(args) > 2 else router_host
+                    port = int(args[3]) if len(args) > 3 else router_port
+                    self.download_file(name, dest_path, host, port)
+                elif cmd == "upload":
+                    # upload <local_path> <dest_name> [host] [port]
+                    args = parts[1].split() if len(parts) > 1 else []
+                    if len(args) < 2:
+                        print("Usage: upload <local_path> <dest_name> [host] [port]")
+                        continue
+                    local_path = args[0]
+                    dest_name = args[1]
+                    host = args[2] if len(args) > 2 else router_host
+                    port = int(args[3]) if len(args) > 3 else router_port
+                    self.upload_file(local_path, dest_name, host, port)
                 
                 elif cmd == "help":
                     print("\nAvailable commands:")
@@ -290,6 +315,140 @@ class SimpleClient:
             print(f"  Success Rate:       {success_rate:.1f}%")
         
         print(f"{'='*70}\n")
+
+    def upload_file(self, local_path: str, dest_name: str, host: str = "127.0.0.1", port: int = 9001):
+        """Upload a local file to a storage node by sending a DataPacket with the file bytes."""
+        import os
+        import json, base64
+        from common import DataPacket
+
+        if not os.path.exists(local_path):
+            print(f"Local file not found: {local_path}")
+            return False
+
+        try:
+            with open(local_path, 'rb') as f:
+                data = f.read()
+            total_len = len(data)
+            # Conservative fragment payload size to avoid UDP limits (JSON+base64 overhead)
+            # Increased to 4KB to reduce fragment count; adjust if you see UDP errors.
+            fragment_size = 4096
+
+            if total_len <= fragment_size:
+                # Wrap payload with uploader metadata to allow storage node to record owner
+                wrapper = {
+                    "uploader": self.client_id,
+                    "data_b64": base64.b64encode(data).decode('utf-8')
+                }
+                pkt = DataPacket(name=dest_name, data_payload=json.dumps(wrapper).encode('utf-8'))
+                pkt_json = pkt.to_json()
+
+                print(f"Uploading '{local_path}' -> '{dest_name}' to {host}:{port} ({len(data)} bytes)")
+                resp = self.comm_module.send_packet_sync(host, port, pkt_json)
+
+                if resp:
+                    try:
+                        resp_pkt = DataPacket.from_json(resp)
+                        print(f"Upload response: {resp_pkt.name} - {resp_pkt.data_payload.decode('utf-8', errors='ignore')}")
+                    except Exception:
+                        print(f"Upload response (raw): {resp[:200]}")
+                    return True
+                else:
+                    print("No response (timeout) from target")
+                    return False
+
+            # Large file: fragment and send parts
+            fragments = []
+            for i in range(0, total_len, fragment_size):
+                fragments.append(data[i:i + fragment_size])
+
+            total = len(fragments)
+            print(f"Uploading in {total} fragments ({fragment_size} bytes each max)")
+
+            for idx, chunk in enumerate(fragments, start=1):
+                frag_name = f"{dest_name}:[{idx}/{total}]"
+                wrapper = {
+                    "uploader": self.client_id,
+                    "data_b64": base64.b64encode(chunk).decode('utf-8')
+                }
+                pkt = DataPacket(name=frag_name, data_payload=json.dumps(wrapper).encode('utf-8'))
+                pkt_json = pkt.to_json()
+
+                print(f" Sending fragment {idx}/{total} -> {host}:{port} ({len(chunk)} bytes)")
+                resp = self.comm_module.send_packet_sync(host, port, pkt_json)
+
+                if resp:
+                    try:
+                        resp_pkt = DataPacket.from_json(resp)
+                        print(f"  Ack: {resp_pkt.name} - {resp_pkt.data_payload.decode('utf-8', errors='ignore')}")
+                    except Exception:
+                        print(f"  Ack (raw): {resp[:200]}")
+                else:
+                    print(f"  ✗ No response for fragment {idx} (timeout)")
+                    return False
+
+            print("Upload complete (all fragments sent)")
+            return True
+
+        except Exception as e:
+            print(f"Error uploading file: {e}")
+            return False
+
+    def download_file(self, content_name: str, dest_path: str = None, host: str = "127.0.0.1", port: int = 8001):
+        """Download named content (READ) from the router/storage and save to disk.
+
+        `content_name` is the logical name (e.g. `/dlsu/uploads/foo.zip`).
+        If `dest_path` is None, the file is saved to the current directory using
+        the basename of `content_name`.
+        """
+        from common import create_interest_packet, DataPacket
+
+        interest = create_interest_packet(content_name, self.client_id, "READ")
+        print(f"Requesting download: {content_name} from {host}:{port}")
+        resp = self.comm_module.send_packet_sync(host, port, interest.to_json())
+
+        if not resp:
+            print("❌ TIMEOUT: No response for download request")
+            return False
+
+        try:
+            data_packet = DataPacket.from_json(resp)
+
+            if data_packet.name == "/error":
+                err = data_packet.data_payload.decode('utf-8', errors='ignore')
+                print(f"❌ Error from node: {err}")
+                return False
+
+            payload = data_packet.data_payload
+
+            # Determine destination filename
+            safe_name = os.path.basename(content_name) or f"download_{int(time.time())}"
+
+            # If dest_path provided and is directory, join with safe_name
+            if dest_path:
+                if os.path.isdir(dest_path):
+                    out_path = os.path.join(dest_path, safe_name)
+                else:
+                    # Assume dest_path is full filename
+                    out_path = dest_path
+            else:
+                out_path = safe_name
+
+            # Avoid clobbering existing files
+            if os.path.exists(out_path):
+                name, ext = os.path.splitext(out_path)
+                out_path = f"{name}_{int(time.time())}{ext}"
+
+            # Write bytes to disk
+            with open(out_path, 'wb') as wf:
+                wf.write(payload)
+
+            print(f"✓ Saved {len(payload)} bytes to {out_path}")
+            return True
+
+        except Exception as e:
+            print(f"Error handling download response: {e}")
+            return False
 
 
 def main():

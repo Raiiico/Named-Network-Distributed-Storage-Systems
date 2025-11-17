@@ -57,7 +57,10 @@ class StorageModule:
         
         # File management
         self.stored_files: Dict[str, FileMetadata] = {}
-        self.fragment_size = 1024  # 1KB fragments
+        # Fragment size used for reassembly/fragmenting large files when sending
+        # over UDP. Increased from 1KB to 4KB to reduce fragment count while
+        # staying conservative for UDP datagram sizes (base64 increases size).
+        self.fragment_size = 4096  # 4KB fragments
         self._storage_lock = threading.Lock()
         
         # RAID configuration
@@ -106,9 +109,19 @@ class StorageModule:
             # Apply RAID-specific processing
             processed_content, storage_info = self._apply_raid_write(content, file_name)
             
-            # Generate storage path
-            safe_filename = self._sanitize_filename(file_name)
-            file_path = os.path.join(self.storage_path, "files", safe_filename)
+            # Generate storage path using the original basename so uploaded
+            # hierarchical names like '/dlsu/uploads/foo.zip' become 'foo.zip'
+            base_name = os.path.basename(file_name) or file_name
+            safe_base = self._sanitize_filename(base_name)
+            file_path = os.path.join(self.storage_path, "files", safe_base)
+
+            # If a file with the same safe name already exists, avoid clobbering
+            # by appending a timestamp suffix before the extension.
+            if os.path.exists(file_path):
+                name, ext = os.path.splitext(safe_base)
+                timestamp = int(time.time())
+                safe_base = f"{name}_{timestamp}{ext}"
+                file_path = os.path.join(self.storage_path, "files", safe_base)
             
             # Write processed content to disk
             with open(file_path, 'wb') as f:

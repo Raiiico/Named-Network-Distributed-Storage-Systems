@@ -44,34 +44,22 @@ class RoutingModule:
         print(f"[{self.node_name}][ROUTING] Routing Module initialized")
     
     def _initialize_default_routes(self):
-        """Initialize default static routes"""
-        # Default routes for common content prefixes
-        default_routes = [
-            # Storage node routes
-            ("/dlsu/storage/node1", "127.0.0.1:9001", "eth0"),
-            ("/dlsu/storage/node2", "127.0.0.1:9002", "eth0"),
-            ("/dlsu/storage/node3", "127.0.0.1:9003", "eth0"),
-            ("/dlsu/storage/node4", "127.0.0.1:9004", "eth0"),
-            
-            # General storage route
-            ("/dlsu/storage", "127.0.0.1:9001", "eth0"),
-            
-            # Public content routes
-            ("/dlsu/public", "127.0.0.1:9001", "eth0"),
-            ("/dlsu/hello", "127.0.0.1:9001", "eth0"),
-            
-            # User directories
-            ("/dlsu/alice", "127.0.0.1:9002", "eth0"),
-            ("/dlsu/bob", "127.0.0.1:9003", "eth0"),
-            
-            # Shared content
-            ("/dlsu/shared", "127.0.0.1:9004", "eth0"),
-        ]
+        """Initialize default static routes - REMOVED"""
+        # Don't initialize anything here
+        print(f"[{self.node_name}][ROUTING] FIB empty - waiting for configuration")
+
+    def load_fib_from_config(self, routes_config):
+        """
+        Load FIB from external configuration
+        routes_config: list of tuples (prefix, next_hop, interface, hop_count)
+        """
+        print(f"[{self.node_name}][ROUTING] Loading FIB configuration...")
         
-        for prefix, next_hop, interface in default_routes:
-            self.add_route(prefix, next_hop, interface)
+        for route in routes_config:
+            prefix, next_hop, interface, hop_count = route
+            self.add_route(prefix, next_hop, interface, hop_count)
         
-        print(f"[{self.node_name}][ROUTING] Initialized {len(default_routes)} default routes")
+        print(f"[{self.node_name}][ROUTING] Loaded {len(routes_config)} routes")
     
     def add_route(self, prefix: str, next_hop: str, interface: str, hop_count: int = 1):
         """Add a route to the FIB"""
@@ -121,6 +109,11 @@ class RoutingModule:
                 
                 print(f"[{self.node_name}][ROUTING] No route found for {content_name}")
                 return None
+    def clear_fib(self):
+        """Clear all FIB entries"""
+        with self._fib_lock:
+            self.fib.clear()
+        print(f"[{self.node_name}][ROUTING] FIB cleared")
     
     def _get_default_route(self) -> Optional[RoutingEntry]:
         """Get default route (first storage node)"""

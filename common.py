@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Named Networks Framework - Common Components
-Standardized checksum implementation to fix mismatch warnings
+FIXED: Nonce removed per adviser feedback
 """
 
 import json
@@ -25,13 +25,12 @@ class InterestPacket:
     user_id: str = ""                 # User identifier
     operation: str = "READ"           # READ, WRITE, PERMISSION
     auth_key: Optional[str] = None    # One-time authentication key
-    nonce: int = 0                    # Duplicate detection
     checksum: str = ""                # Packet integrity
     
     def to_json(self):
         """Serialize to JSON with standardized checksum"""
-        # Calculate checksum from deterministic content
-        checksum_content = f"{self.name}|{self.user_id}|{self.operation}|{self.nonce}"
+        # Calculate checksum from deterministic content (NO NONCE)
+        checksum_content = f"{self.name}|{self.user_id}|{self.operation}"
         self.checksum = calculate_checksum(checksum_content)
         
         return json.dumps({
@@ -40,7 +39,6 @@ class InterestPacket:
             "user_id": self.user_id,
             "operation": self.operation,
             "auth_key": self.auth_key,
-            "nonce": self.nonce,
             "checksum": self.checksum
         })
     
@@ -56,7 +54,6 @@ class InterestPacket:
             user_id=data.get("user_id", ""),
             operation=data.get("operation", "READ"),
             auth_key=data.get("auth_key"),
-            nonce=data.get("nonce", 0),
             checksum=data.get("checksum", "")
         )
         
@@ -64,7 +61,7 @@ class InterestPacket:
     
     def validate_checksum(self) -> bool:
         """Validate packet checksum"""
-        expected_content = f"{self.name}|{self.user_id}|{self.operation}|{self.nonce}"
+        expected_content = f"{self.name}|{self.user_id}|{self.operation}"
         expected_checksum = calculate_checksum(expected_content)
         return self.checksum == expected_checksum
 
@@ -199,14 +196,9 @@ class PendingInterestTable:
         with self._lock:
             return len(self.table)
 
-def generate_nonce():
-    """Generate a nonce for Interest packets"""
-    return int(time.time() * 1000) % 100000
-
 def calculate_checksum(data: str) -> str:
     """
     Standardized checksum calculation using SHA-256
-    Fixes the checksum mismatch warnings
     """
     if isinstance(data, bytes):
         data = data.decode('utf-8', errors='ignore')
@@ -250,12 +242,11 @@ def parse_fragment_notation(name: str) -> Optional[dict]:
 
 # Compatibility functions for existing code
 def create_interest_packet(name: str, user_id: str, operation: str = "READ") -> InterestPacket:
-    """Create Interest packet with proper checksum"""
+    """Create Interest packet with proper checksum (NO NONCE)"""
     return InterestPacket(
         name=name,
         user_id=user_id,
-        operation=operation,
-        nonce=generate_nonce()
+        operation=operation
     )
 
 def create_data_packet(name: str, content: str) -> DataPacket:
@@ -270,7 +261,7 @@ def create_data_packet(name: str, content: str) -> DataPacket:
 
 # Test checksum consistency
 if __name__ == "__main__":
-    print("Testing checksum consistency...")
+    print("Testing checksum consistency (NO NONCE)...")
     
     # Test Interest packet
     interest = create_interest_packet("/test/file", "alice", "READ")
