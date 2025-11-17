@@ -1,0 +1,7 @@
+# Format: resource,user,permission
+/files/alice_document.txt,Alice,READ
+/files/alice_document.txt,Bob,NONE
+/files/shared_document.txt,Alice,READ
+/files/shared_document.txt,Bob,READ
+/files/secure_document.txt,Alice,WRITE
+/files/secure_document.txt,Bob,NONE
