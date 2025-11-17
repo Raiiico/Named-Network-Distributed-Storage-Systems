@@ -371,6 +371,10 @@ class SecurityModule:
             )
             
             acl.acl_entries[owner] = owner_ace
+            # If the resource name indicates a shared resource, make it public
+            if "shared" in resource_name.lower():
+                acl.is_public = True
+
             self.resource_acls[resource_name] = acl
             self.stats["total_resources"] += 1
             
@@ -459,47 +463,49 @@ class SecurityModule:
         """Check if user has required permission for resource"""
         self.stats["permission_checks"] += 1
         
+        # Acquire the ACL reference under lock, but avoid holding the lock
+        # while calling create_resource_acl (which also acquires the same lock).
         with self.acl_lock:
             acl = self.resource_acls.get(resource_name)
-            
-            if not acl:
-                # Resource doesn't exist - create it with user as owner
-                self.create_resource_acl(resource_name, user_id)
-                self.stats["permission_grants"] += 1
-                return SecurityResponse(
-                    success=True,
-                    authorized=True,
-                    message="Resource created with user as owner"
-                )
-            
-            # Check if resource is public
-            if acl.is_public and required_permission == PermissionLevel.READ:
-                self.stats["permission_grants"] += 1
-                return SecurityResponse(
-                    success=True,
-                    authorized=True,
-                    message="Public resource - read access granted"
-                )
-            
-            # Check user permissions
-            has_perm = self._has_permission(acl, user_id, required_permission.value)
-            
-            if has_perm:
-                self.stats["permission_grants"] += 1
-                print(f"[{self.node_name}][SECURITY] ✓ Permission granted: {user_id} -> {resource_name} ({required_permission.name})")
-                return SecurityResponse(
-                    success=True,
-                    authorized=True,
-                    message="Permission granted"
-                )
-            else:
-                self.stats["permission_denials"] += 1
-                print(f"[{self.node_name}][SECURITY] ✗ Permission denied: {user_id} -> {resource_name} ({required_permission.name})")
-                return SecurityResponse(
-                    success=True,
-                    authorized=False,
-                    message="Permission denied"
-                )
+
+        if not acl:
+            # Resource doesn't exist - create it with user as owner
+            self.create_resource_acl(resource_name, user_id)
+            self.stats["permission_grants"] += 1
+            return SecurityResponse(
+                success=True,
+                authorized=True,
+                message="Resource created with user as owner"
+            )
+
+        # Check if resource is public
+        if acl.is_public and required_permission == PermissionLevel.READ:
+            self.stats["permission_grants"] += 1
+            return SecurityResponse(
+                success=True,
+                authorized=True,
+                message="Public resource - read access granted"
+            )
+
+        # Check user permissions
+        has_perm = self._has_permission(acl, user_id, required_permission.value)
+
+        if has_perm:
+            self.stats["permission_grants"] += 1
+            print(f"[{self.node_name}][SECURITY] ✓ Permission granted: {user_id} -> {resource_name} ({required_permission.name})")
+            return SecurityResponse(
+                success=True,
+                authorized=True,
+                message="Permission granted"
+            )
+        else:
+            self.stats["permission_denials"] += 1
+            print(f"[{self.node_name}][SECURITY] ✗ Permission denied: {user_id} -> {resource_name} ({required_permission.name})")
+            return SecurityResponse(
+                success=True,
+                authorized=False,
+                message="Permission denied"
+            )
     
     def _has_permission(self, acl: ResourceACL, user_id: str, required_permission: int) -> bool:
         """Check if user has required permission in ACL"""
