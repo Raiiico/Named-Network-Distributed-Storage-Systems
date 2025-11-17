@@ -13,6 +13,8 @@ from communication_module import CommunicationModule
 from parsing_module import ParsingModule
 from common import InterestPacket, DataPacket, calculate_checksum
 
+from storage_module import StorageModule
+
 class SimpleStorageNode:
     """
     Simple Storage Node for demonstrating hub-and-spoke topology
@@ -32,8 +34,10 @@ class SimpleStorageNode:
         
         # Initialize modules
         self.comm_module = CommunicationModule(self.node_name, host, port)
-        self.parsing_module = ParsingModule(self.node_name)
-        
+        self.parsing_module = ParsingModule(self.node_name)      
+        # Initialize Storage Module with RAID
+        self.storage_module = StorageModule(self.node_name, raid_level, self.storage_path)
+    
         # Storage data
         self.stored_files = {}
         
@@ -99,83 +103,98 @@ class SimpleStorageNode:
             return self._create_error_response(f"Storage error: {str(e)}")
     
     def _handle_read_request(self, interest: InterestPacket):
-        """Handle READ requests"""
+        """Handle READ requests using Storage Module"""
         file_name = interest.name
         
-        # Check if file exists in storage
-        if file_name in self.stored_files:
+        print(f"\n[{self.node_name}] === READ REQUEST ===")
+        print(f"[{self.node_name}] File: {file_name}")
+        
+        # Try Storage Module first (RAID-processed files)
+        storage_response = self.storage_module.retrieve_file(file_name)
+        
+        if storage_response.success:
+            self.stats["files_retrieved"] += 1
+            
+            print(f"[{self.node_name}] ✓ Retrieved from RAID {self.raid_level} storage")
+            print(f"[{self.node_name}] Size: {len(storage_response.content)} bytes")
+            
+            response_content = f"""RAID {self.raid_level} Storage Response:
+File: {file_name}
+Content: {storage_response.content.decode('utf-8', errors='ignore')}
+Size: {len(storage_response.content)} bytes
+RAID Level: {self.raid_level}
+Checksum: {storage_response.metadata.checksum}
+Storage Node: {self.node_name}"""
+            
+            return self._create_data_response(file_name, response_content)
+        
+        # Fallback to in-memory (for pre-loaded test files)
+        elif file_name in self.stored_files:
             file_data = self.stored_files[file_name]
             self.stats["files_retrieved"] += 1
             
-            print(f"[{self.node_name}] ✓ File found: {file_name}")
-            print(f"[{self.node_name}] Size: {len(file_data['content'])} bytes")
-            print(f"[{self.node_name}] RAID: {self.raid_level}")
+            print(f"[{self.node_name}] ✓ Retrieved from memory (test file)")
             
-            # Create response with file content
             response_content = f"""RAID {self.raid_level} Storage Response:
 File: {file_name}
 Content: {file_data['content'].decode('utf-8', errors='ignore')}
 Stored: {file_data['stored_at']}
 Checksum: {file_data['checksum']}
 Storage Node: {self.node_name}"""
-            
+        
             return self._create_data_response(file_name, response_content)
         
         else:
-            # File not found, but provide meaningful response
-            print(f"[{self.node_name}] ✗ File not found: {file_name}")
-            
-            response_content = f"""RAID {self.raid_level} Storage Response:
-File: {file_name}
-Status: Available for storage
-Storage Node: {self.node_name}
-RAID Level: {self.raid_level}
-Available Space: 1.2TB
-Files Stored: {len(self.stored_files)}"""
-            
-            return self._create_data_response(file_name, response_content)
-    
+            print(f"[{self.node_name}] ✗ File not found")
+            return self._create_error_response(f"File not found: {file_name}")
+        
+        
     def _handle_write_request(self, interest: InterestPacket):
-        """Handle WRITE requests with actual file content"""
+        """Handle WRITE requests using Storage Module"""
         file_name = interest.name
         
-        # For demo: simulate content (in real system, content would come in Interest payload)
+        # Generate content (in real system, comes from Interest payload)
         content = f"User {interest.user_id} wrote to {file_name} at {time.strftime('%Y-%m-%d %H:%M:%S')}"
         content_bytes = content.encode('utf-8')
         
-        # Write to actual file
-        safe_filename = file_name.replace('/', '_')
-        file_path = os.path.join(self.storage_path, f"{safe_filename}.txt")
-        
-        with open(file_path, 'w') as f:
-            f.write(content)
-        
-        # Store in memory
-        self.stored_files[file_name] = {
-            "content": content_bytes,
-            "file_path": file_path,  # Add file path
-            "stored_at": time.strftime('%Y-%m-%d %H:%M:%S'),
-            "checksum": hashlib.md5(content_bytes).hexdigest(),
-            "size": len(content_bytes),
-            "user": interest.user_id
-        }
-        
-        self.stats["files_stored"] += 1
-        self.stats["bytes_stored"] += len(content_bytes)
-        
-        print(f"[{self.node_name}] ✓ File stored: {file_name}")
+        print(f"\n[{self.node_name}] === WRITE REQUEST ===")
+        print(f"[{self.node_name}] File: {file_name}")
         print(f"[{self.node_name}] User: {interest.user_id}")
-        print(f"[{self.node_name}] RAID: {self.raid_level}")
+        print(f"[{self.node_name}] Size: {len(content_bytes)} bytes")
         
-        response_content = f"""RAID {self.raid_level} Write Confirmation:
+        # USE Storage Module for RAID processing
+        storage_response = self.storage_module.store_file(file_name, content_bytes)
+        
+        if storage_response.success:
+            # Also keep in memory for quick access
+            self.stored_files[file_name] = {
+                "content": content_bytes,
+                "stored_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+                "checksum": storage_response.metadata.checksum,
+                "size": len(content_bytes),
+                "user": interest.user_id,
+                "raid_processed": True
+            }
+            
+            self.stats["files_stored"] += 1
+            self.stats["bytes_stored"] += len(content_bytes)
+            
+            print(f"[{self.node_name}] ✓ RAID {self.raid_level} processing complete")
+            print(f"[{self.node_name}] Original: {storage_response.metadata.original_size} bytes")
+            print(f"[{self.node_name}] Stored: {storage_response.metadata.stored_size} bytes")
+            
+            response_content = f"""RAID {self.raid_level} Write Confirmation:
 File: {file_name}
-Status: Successfully stored
-Size: {len(content_bytes)} bytes
-RAID Level: {self.raid_level}
+Status: Successfully stored with RAID {self.raid_level}
+Original Size: {storage_response.metadata.original_size} bytes
+Stored Size: {storage_response.metadata.stored_size} bytes
 Storage Node: {self.node_name}
 User: {interest.user_id}"""
-        
-        return self._create_data_response(file_name, response_content)
+            
+            return self._create_data_response(file_name, response_content)
+        else:
+            print(f"[{self.node_name}] ✗ Storage error: {storage_response.error}")
+            return self._create_error_response(storage_response.error)
     
     def _handle_permission_request(self, interest: InterestPacket):
         """Handle PERMISSION requests"""
@@ -287,6 +306,7 @@ RAID Level: {self.raid_level}"""
         print("\nStorage Node Commands:")
         print("  show files   - List stored files")
         print("  show stats   - Display statistics")
+        print("  show raid    - Display RAID information")  # ADD 
         print("  store <name> - Store a test file")
         print("  quit         - Stop storage node")
         print()
@@ -301,6 +321,8 @@ RAID Level: {self.raid_level}"""
                     self._show_files()
                 elif command == "show stats":
                     self._show_stats()
+                elif command == "show raid":  # ADD 
+                    self._show_raid_info()
                 elif command.startswith("store"):
                     parts = command.split(maxsplit=1)
                     if len(parts) > 1:
@@ -314,6 +336,21 @@ RAID Level: {self.raid_level}"""
                     
             except (KeyboardInterrupt, EOFError):
                 break
+    
+    def _show_raid_info(self):
+        """Show RAID storage information"""
+        info = self.storage_module.get_storage_info()
+        
+        print(f"\n=== {self.node_name} RAID Information ===")
+        print(f"RAID Level: {info['raid_level']} ({info['raid_description']})")
+        print(f"Storage Path: {info['storage_path']}")
+        print(f"Files Stored: {info['files_stored']}")
+        print(f"Files Retrieved: {info['files_retrieved']}")
+        print(f"Total Files: {info['total_files']}")
+        print(f"Total Size: {info['total_size_bytes']} bytes")
+        print(f"RAID Operations: {info['raid_operations']}")
+        print(f"Parity Calculations: {info['parity_calculations']}")
+        print("=" * 50)
     
     def _show_files(self):
         """Show stored files"""
