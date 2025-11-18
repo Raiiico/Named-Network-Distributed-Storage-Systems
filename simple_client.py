@@ -214,10 +214,10 @@ class SimpleClient:
         print(f"{'='*70}")
         print(f"Router: {router_host}:{router_port}")
         print(f"\nCommands:")
-        print(f"  read <name>       - Send READ Interest")
-        print(f"  write <name>      - Send WRITE Interest")
+        print(f"  read <name>       - Download file (sends READ interest)")
+        print(f"  write <name>      - Upload file (prompts for local path, performs WRITE)")
         print(f"  permission <name> - Send PERMISSION Interest")
-        print(f"  download <name> [dest_path] - Download content and save to disk")
+        # 'download' command removed; use 'read <name>' which saves to downloaded_files/
         print(f"  concurrent        - Run concurrent test")
         print(f"  stats             - Show statistics")
         print(f"  quit              - Exit")
@@ -248,32 +248,36 @@ class SimpleClient:
                         print("  Usage: <operation> <name>")
                         print("  Example: read /dlsu/hello")
                         continue
-                    
+
                     name = parts[1]
-                    operation = cmd.upper()
-                    self.send_interest(name, operation, router_host, router_port)
-                elif cmd == "download":
-                    # download <name> [dest_path] [host] [port]
-                    args = parts[1].split() if len(parts) > 1 else []
-                    if len(args) < 1:
-                        print("Usage: download <name> [dest_path] [host] [port]")
-                        continue
-                    name = args[0]
-                    dest_path = args[1] if len(args) > 1 else None
-                    host = args[2] if len(args) > 2 else router_host
-                    port = int(args[3]) if len(args) > 3 else router_port
-                    self.download_file(name, dest_path, host, port)
-                elif cmd == "upload":
-                    # upload <local_path> <dest_name> [host] [port]
-                    args = parts[1].split() if len(parts) > 1 else []
-                    if len(args) < 2:
-                        print("Usage: upload <local_path> <dest_name> [host] [port]")
-                        continue
-                    local_path = args[0]
-                    dest_name = args[1]
-                    host = args[2] if len(args) > 2 else router_host
-                    port = int(args[3]) if len(args) > 3 else router_port
-                    self.upload_file(local_path, dest_name, host, port)
+                    operation = cmd.lower()
+                    if operation == 'permission':
+                        # Simple permission check against auth server
+                        pwd = input(f"Password for {self.client_id} (blank to skip): ")
+                        ok = self._check_permission(name, 'READ', password=pwd)
+                        print(f"Permission check: {'AUTHORIZED' if ok else 'DENIED'}")
+                    elif operation == 'read':
+                        # Download file (requires permission)
+                        pwd = input(f"Password for {self.client_id} (blank to skip): ")
+                        self._do_read(name, router_host, router_port, password=pwd)
+                    elif operation == 'write':
+                        # Upload file: prompt local path and destination (name)
+                        local_path = input('Local file path to upload: ').strip()
+                        if not local_path:
+                            print('Upload cancelled')
+                            continue
+                        pwd = input(f"Password for {self.client_id} (blank to skip): ")
+                        # Ask for storage host/port (optional)
+                        storage = input(f"Storage host:port [127.0.0.1:9001]: ").strip() or '127.0.0.1:9001'
+                        try:
+                            shost, sport = storage.split(':')
+                            sport = int(sport)
+                        except Exception:
+                            print('Invalid storage address, using 127.0.0.1:9001')
+                            shost, sport = '127.0.0.1', 9001
+
+                        self._do_write(local_path, name, shost, sport, password=pwd)
+                # upload/download commands removed; use 'write' and 'read'
                 
                 elif cmd == "help":
                     print("\nAvailable commands:")
@@ -316,6 +320,120 @@ class SimpleClient:
         
         print(f"{'='*70}\n")
 
+    def _check_permission(self, resource: str, operation: str = 'READ', server_host: str = '127.0.0.1', server_port: int = 7001, password: str = None) -> bool:
+        """Ask AuthenticationServer for permission. Returns True if authorized."""
+        import json
+        payload = {
+            "name": resource,
+            "user_id": self.client_id,
+            "operation": operation
+        }
+        if password:
+            payload['password'] = password
+
+        req = json.dumps(payload)
+        resp = self.comm_module.send_packet_sync(server_host, server_port, req)
+        if not resp:
+            print("Permission check: timeout contacting auth server")
+            return False
+
+        # Response may be plain text containing AUTHORIZED or DENIED, or JSON
+        try:
+            rstr = resp.decode('utf-8') if isinstance(resp, bytes) else str(resp)
+        except Exception:
+            rstr = str(resp)
+
+        if 'AUTHORIZED' in rstr.upper() or 'AUTHORIZED' in rstr:
+            return True
+        try:
+            robj = json.loads(rstr)
+            return bool(robj.get('authorized'))
+        except Exception:
+            return False
+
+    def _do_read(self, content_name: str, router_host: str, router_port: int, password: str = None):
+        """Perform authenticated READ: check permission, then request and save file."""
+        # Check permission with auth server first
+        if not self._check_permission(content_name, 'READ', password=password):
+            print("❌ Permission denied by AuthenticationServer")
+            return False
+        # Use the improved download helper which listens for fragments
+        return self.download_file(content_name, dest_path=None, host=router_host, port=router_port)
+
+    def _do_write(self, local_path: str, dest_name: str, storage_host: str = '127.0.0.1', storage_port: int = 9001, password: str = None):
+        """Perform authenticated WRITE: check permission, then upload file to storage host."""
+        if not os.path.exists(local_path):
+            print(f"Local file not found: {local_path}")
+            return False
+        # If dest_name looks like a bare filename (no '/'), default to placing
+        # it under the logical `/files/` namespace on the storage node.
+        if not dest_name or '/' not in dest_name:
+            base = os.path.basename(dest_name) if dest_name else os.path.basename(local_path)
+            dest_name = f"/files/{base}"
+
+        if not self._check_permission(dest_name, 'WRITE', password=password):
+            print("❌ Permission denied by AuthenticationServer")
+            return False
+
+        try:
+            with open(local_path, 'rb') as f:
+                data = f.read()
+        except Exception as e:
+            print(f"Error reading local file: {e}")
+            return False
+
+        # Fragment and send to storage (same logic as previous upload_file)
+        import json, base64
+        from common import DataPacket
+
+        total_len = len(data)
+        # Match storage fragment size (keep conservative for UDP MTU)
+        fragment_size = 1024
+
+        if total_len <= fragment_size:
+            wrapper = {"uploader": self.client_id, "data_b64": base64.b64encode(data).decode('utf-8')}
+            pkt = DataPacket(name=dest_name, data_payload=json.dumps(wrapper).encode('utf-8'))
+            pkt_json = pkt.to_json()
+            print(f"Uploading '{local_path}' -> '{dest_name}' to {storage_host}:{storage_port} ({len(data)} bytes)")
+            resp = self.comm_module.send_packet_sync(storage_host, storage_port, pkt_json)
+            if resp:
+                try:
+                    resp_pkt = DataPacket.from_json(resp)
+                    print(f"Upload response: {resp_pkt.name} - {resp_pkt.data_payload.decode('utf-8', errors='ignore')}")
+                except Exception:
+                    print(f"Upload response (raw): {resp[:200]}")
+                return True
+            else:
+                print("No response (timeout) from target")
+                return False
+
+        fragments = [data[i:i+fragment_size] for i in range(0, total_len, fragment_size)]
+        total = len(fragments)
+        print(f"Uploading in {total} fragments ({fragment_size} bytes each max)")
+
+        for idx, chunk in enumerate(fragments, start=1):
+            frag_name = f"{dest_name}:[{idx}/{total}]"
+            wrapper = {"uploader": self.client_id, "data_b64": base64.b64encode(chunk).decode('utf-8')}
+            pkt = DataPacket(name=frag_name, data_payload=json.dumps(wrapper).encode('utf-8'))
+            pkt_json = pkt.to_json()
+
+            print(f" Sending fragment {idx}/{total} -> {storage_host}:{storage_port} ({len(chunk)} bytes)")
+            resp = self.comm_module.send_packet_sync(storage_host, storage_port, pkt_json)
+
+            if resp:
+                try:
+                    resp_pkt = DataPacket.from_json(resp)
+                    print(f"  Ack: {resp_pkt.name} - {resp_pkt.data_payload.decode('utf-8', errors='ignore')}")
+                except Exception:
+                    print(f"  Ack (raw): {resp[:200]}")
+            else:
+                print(f"  ✗ No response for fragment {idx} (timeout)")
+                return False
+
+        print("Upload complete (all fragments sent)")
+        return True
+
+
     def upload_file(self, local_path: str, dest_name: str, host: str = "127.0.0.1", port: int = 9001):
         """Upload a local file to a storage node by sending a DataPacket with the file bytes."""
         import os
@@ -332,7 +450,7 @@ class SimpleClient:
             total_len = len(data)
             # Conservative fragment payload size to avoid UDP limits (JSON+base64 overhead)
             # Increased to 4KB to reduce fragment count; adjust if you see UDP errors.
-            fragment_size = 4096
+            fragment_size = 1024
 
             if total_len <= fragment_size:
                 # Wrap payload with uploader metadata to allow storage node to record owner
@@ -401,8 +519,13 @@ class SimpleClient:
         If `dest_path` is None, the file is saved to the current directory using
         the basename of `content_name`.
         """
-        from common import create_interest_packet, DataPacket
+        from common import create_interest_packet, DataPacket, parse_fragment_notation
 
+        # Default landing directory for downloads
+        downloads_dir = dest_path if dest_path else os.path.join('.', 'downloaded_files')
+        os.makedirs(downloads_dir, exist_ok=True)
+
+        # Request first fragment / packet synchronously from router
         interest = create_interest_packet(content_name, self.client_id, "READ")
         print(f"Requesting download: {content_name} from {host}:{port}")
         resp = self.comm_module.send_packet_sync(host, port, interest.to_json())
@@ -412,43 +535,79 @@ class SimpleClient:
             return False
 
         try:
-            data_packet = DataPacket.from_json(resp)
+            pkt = DataPacket.from_json(resp)
+        except Exception as e:
+            print(f"Error parsing response: {e}")
+            return False
 
-            if data_packet.name == "/error":
-                err = data_packet.data_payload.decode('utf-8', errors='ignore')
-                print(f"❌ Error from node: {err}")
-                return False
+        if pkt.name == "/error":
+            err = pkt.data_payload.decode('utf-8', errors='ignore')
+            print(f"❌ Error from node: {err}")
+            return False
 
-            payload = data_packet.data_payload
-
-            # Determine destination filename
+        # If single-packet (no fragments) -> save and return
+        if ':[' not in pkt.name:
+            content = pkt.data_payload
             safe_name = os.path.basename(content_name) or f"download_{int(time.time())}"
-
-            # If dest_path provided and is directory, join with safe_name
-            if dest_path:
-                if os.path.isdir(dest_path):
-                    out_path = os.path.join(dest_path, safe_name)
-                else:
-                    # Assume dest_path is full filename
-                    out_path = dest_path
-            else:
-                out_path = safe_name
-
-            # Avoid clobbering existing files
+            out_path = os.path.join(downloads_dir, safe_name)
             if os.path.exists(out_path):
                 name, ext = os.path.splitext(out_path)
                 out_path = f"{name}_{int(time.time())}{ext}"
-
-            # Write bytes to disk
             with open(out_path, 'wb') as wf:
-                wf.write(payload)
-
-            print(f"✓ Saved {len(payload)} bytes to {out_path}")
+                wf.write(content)
+            print(f"✓ Saved {len(content)} bytes to {out_path}")
             return True
 
-        except Exception as e:
-            print(f"Error handling download response: {e}")
+        # Otherwise, pkt.name includes fragment info -> parse and pull remaining fragments
+        try:
+            base, frag = pkt.name.split(':[' ,1)
+            frag_info = frag.rstrip(']')
+            idx_s, total_s = frag_info.split('/')
+            idx0 = int(idx_s)
+            total = int(total_s)
+        except Exception:
+            print("Malformed fragment name from first packet")
             return False
+
+        # Collect fragments into list
+        fragments = {idx0: pkt.data_payload}
+        print(f"Received fragment {idx0}/{total} ({len(pkt.data_payload)} bytes)")
+
+        # Pull remaining fragments sequentially
+        for i in range(1, total + 1):
+            if i in fragments:
+                continue
+            frag_name = f"{base}:[{i}/{total}]"
+            frag_interest = create_interest_packet(frag_name, self.client_id, "READ")
+            resp_i = self.comm_module.send_packet_sync(host, port, frag_interest.to_json())
+            if not resp_i:
+                print(f"❌ TIMEOUT requesting fragment {i}/{total}")
+                return False
+            try:
+                pkt_i = DataPacket.from_json(resp_i)
+            except Exception as e:
+                print(f"Error parsing fragment {i} response: {e}")
+                return False
+
+            if pkt_i.name == "/error":
+                err = pkt_i.data_payload.decode('utf-8', errors='ignore')
+                print(f"❌ Error for fragment {i}: {err}")
+                return False
+
+            fragments[i] = pkt_i.data_payload
+            print(f"Received fragment {i}/{total} ({len(pkt_i.data_payload)} bytes)")
+
+        # Reassemble
+        content = b''.join(fragments[i] for i in range(1, total + 1))
+        safe_name = os.path.basename(base) or f"download_{int(time.time())}"
+        out_path = os.path.join(downloads_dir, safe_name)
+        if os.path.exists(out_path):
+            name, ext = os.path.splitext(out_path)
+            out_path = f"{name}_{int(time.time())}{ext}"
+        with open(out_path, 'wb') as wf:
+            wf.write(content)
+        print(f"✓ Saved {len(content)} bytes to {out_path}")
+        return True
 
 
 def main():

@@ -830,3 +830,125 @@ if __name__ == "__main__":
     
     # Show statistics
     security.show_stats()
+
+
+class AuthenticationServer:
+    """Simple UDP-based Authentication/Authorization server wrapper
+    around the SecurityModule. Listens for JSON requests and returns a
+    short textual response containing either 'AUTHORIZED' or 'DENIED' so
+    that the router's string checks continue to work.
+
+    Expected request JSON fields (from router/test harness):
+      - packet_type (optional)
+      - name: resource name
+      - user_id: user requesting access
+      - password: plaintext password (optional)
+      - operation: READ/WRITE
+    """
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 7001):
+        import socket
+        self.host = host
+        self.port = port
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.security = SecurityModule("Auth-Server")
+        self._running = False
+
+    def start(self):
+        import threading
+        try:
+            self.socket.bind((self.host, self.port))
+        except Exception as e:
+            print(f"[AuthServer] Failed to bind {self.host}:{self.port}: {e}")
+            raise
+
+        self._running = True
+        t = threading.Thread(target=self._serve_forever, daemon=True)
+        t.start()
+        print(f"[AuthServer] Listening on {self.host}:{self.port}")
+
+    def stop(self):
+        self._running = False
+        try:
+            self.socket.close()
+        except Exception:
+            pass
+
+    def _serve_forever(self):
+        import json
+        while self._running:
+            try:
+                data, addr = self.socket.recvfrom(65536)
+                try:
+                    req = json.loads(data.decode('utf-8'))
+                except Exception:
+                    # Fallback: treat as plain text command
+                    req = {}
+
+                resource = req.get('name') or req.get('resource') or req.get('resource_name')
+                user_id = req.get('user_id') or req.get('user')
+                password = req.get('password')
+                operation = req.get('operation') or req.get('op') or 'READ'
+
+                # Optional authentication step using password
+                if password and user_id:
+                    auth = self.security.authenticate_user(user_id, password)
+                    if not auth.success:
+                        resp_text = f"DENIED: Authentication failed for {user_id}"
+                        self.socket.sendto(resp_text.encode('utf-8'), addr)
+                        continue
+
+                # If resource not provided, deny
+                if not resource or not user_id:
+                    resp_text = "DENIED: Missing resource or user"
+                    self.socket.sendto(resp_text.encode('utf-8'), addr)
+                    continue
+
+                # Check permission
+                perm = self.security.check_permission(resource, user_id, PermissionLevel.READ)
+                if perm and perm.authorized:
+                    resp_text = f"AUTHORIZED: {user_id} -> {resource}"
+                else:
+                    resp_text = f"DENIED: {user_id} -> {resource}"
+
+                # Also send a JSON payload for richer clients
+                resp_obj = {
+                    "status": "authorized" if perm.authorized else "denied",
+                    "authorized": bool(perm.authorized),
+                    "message": resp_text
+                }
+
+                try:
+                    # Send textual response (router expects substring checks)
+                    self.socket.sendto(resp_text.encode('utf-8'), addr)
+                except Exception:
+                    pass
+
+            except OSError:
+                break
+            except Exception as e:
+                print(f"[AuthServer] Error handling request: {e}")
+                continue
+
+
+if __name__ == "__main__":
+    import sys
+    # CLI: python server.py S1  -> start AuthenticationServer
+    if len(sys.argv) > 1 and sys.argv[1].upper().startswith('S'):
+        host = '127.0.0.1'
+        port = 7001
+        srv = AuthenticationServer(host, port)
+        try:
+            srv.start()
+            print("Authentication server started. Press Ctrl-C to stop.")
+            while True:
+                try:
+                    time.sleep(1)
+                except KeyboardInterrupt:
+                    break
+        finally:
+            srv.stop()
+            print("Authentication server stopped")
+    else:
+        print("Usage: python server.py S1   # start AuthenticationServer on 127.0.0.1:7001")

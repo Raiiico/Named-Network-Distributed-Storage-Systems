@@ -58,9 +58,9 @@ class StorageModule:
         # File management
         self.stored_files: Dict[str, FileMetadata] = {}
         # Fragment size used for reassembly/fragmenting large files when sending
-        # over UDP. Increased from 1KB to 4KB to reduce fragment count while
-        # staying conservative for UDP datagram sizes (base64 increases size).
-        self.fragment_size = 4096  # 4KB fragments
+        # over UDP. To avoid OS/UDP datagram-too-large (MTU) issues on localhost
+        # and to account for base64+JSON overhead, keep fragments conservative.
+        self.fragment_size = 4096  # 5KB fragments (safe for UDP transport)
         self._storage_lock = threading.Lock()
         
         # RAID configuration
@@ -181,8 +181,18 @@ class StorageModule:
                 )
             
             # Read stored content
-            with open(metadata.file_path, 'rb') as f:
-                stored_content = f.read()
+            # If file was stored as fragments, reassemble from fragment files
+            if metadata.fragments:
+                parts = []
+                # fragments is a dict index -> fragment_path
+                for idx in sorted(metadata.fragments.keys()):
+                    frag_path = metadata.fragments[idx]
+                    with open(frag_path, 'rb') as ff:
+                        parts.append(ff.read())
+                stored_content = b''.join(parts)
+            else:
+                with open(metadata.file_path, 'rb') as f:
+                    stored_content = f.read()
             
             # Apply RAID-specific read processing
             original_content = self._apply_raid_read(stored_content, metadata)
@@ -368,6 +378,60 @@ class StorageModule:
             safe_name = f"file_{int(time.time())}"
         
         return safe_name
+
+    def store_fragments(self, file_name: str, fragments: Dict[int, bytes]) -> StorageResponse:
+        """Store fragments on disk under `fragments/` and record metadata.
+
+        `fragments` is a dict mapping 1-based index -> bytes for that fragment.
+        The method writes each fragment as a separate file and records their
+        paths in metadata.fragments. It computes checksum over the reassembled
+        original content for integrity.
+        """
+        try:
+            # Reassemble in memory to compute checksum and sizes
+            ordered = [fragments[i] for i in sorted(fragments.keys())]
+            assembled = b''.join(ordered)
+
+            base_name = os.path.basename(file_name) or file_name
+            safe_base = self._sanitize_filename(base_name)
+
+            frag_dir = os.path.join(self.storage_path, 'fragments')
+            os.makedirs(frag_dir, exist_ok=True)
+
+            fragments_map = {}
+            for idx in sorted(fragments.keys()):
+                frag_fname = f"{safe_base}_[{idx}_{len(fragments)}]"
+                frag_path = os.path.join(frag_dir, frag_fname)
+                # If exists, append timestamp
+                if os.path.exists(frag_path):
+                    name, ext = os.path.splitext(frag_fname)
+                    frag_fname = f"{name}_{int(time.time())}{ext}"
+                    frag_path = os.path.join(frag_dir, frag_fname)
+                with open(frag_path, 'wb') as ff:
+                    ff.write(fragments[idx])
+                fragments_map[idx] = frag_path
+
+            metadata = FileMetadata(
+                file_name=file_name,
+                original_size=len(assembled),
+                stored_size=sum(len(b) for b in fragments.values()),
+                raid_level=self.raid_level.value,
+                checksum=hashlib.md5(assembled).hexdigest(),
+                stored_at=time.time(),
+                file_path='',
+                fragments=fragments_map
+            )
+
+            with self._storage_lock:
+                self.stored_files[file_name] = metadata
+
+            self.stats["files_stored"] += 1
+            self.stats["bytes_written"] += len(assembled)
+
+            return StorageResponse(success=True, metadata=metadata)
+
+        except Exception as e:
+            return StorageResponse(success=False, error=f"Fragment store error: {e}")
     
     def fragment_file(self, content: bytes) -> Dict[int, bytes]:
         """Fragment large files into smaller chunks"""

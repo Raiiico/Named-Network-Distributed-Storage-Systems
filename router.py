@@ -62,6 +62,8 @@ class Router:
             "cache_misses": 0,
             "uptime_start": time.time()
         }
+        # Simple PIT: name -> set of requesting faces (host:port strings)
+        self.pit = {}
         
         # Set up module interfaces
         self._setup_module_interfaces()
@@ -140,6 +142,14 @@ class Router:
     
     def _route_interest_packet(self, interest: 'InterestPacket', source: str):
         """Route Interest packet through the network"""
+        # Record incoming face in PIT for later Data forwarding
+        try:
+            if interest.name not in self.pit:
+                self.pit[interest.name] = set()
+            self.pit[interest.name].add(source)
+            self._log_debug(f"[PIT] Added face {source} for {interest.name}", "pit")
+        except Exception:
+            pass
         # Step 1: Check local Content Store for cached data
         try:
             cached_data = self.processing_module.content_store.get(interest.name)
@@ -254,7 +264,54 @@ class Router:
         # Cache the data packet
         self.processing_module.content_store.put(data_packet.name, data_packet.data_payload)
         self._log_control(f"[CACHE] Stored: {data_packet.name}")
-        
+
+        # Forward data to all requesting faces recorded in PIT
+        faces = self.pit.get(data_packet.name, set())
+        # If no direct match, handle fragment notation by using base name
+        if not faces and ':[' in data_packet.name:
+            base_name = data_packet.name.split(':[' ,1)[0]
+            faces = self.pit.get(base_name, set())
+        if faces:
+            for face in list(faces):
+                try:
+                    host, port_s = face.split(":")
+                    port = int(port_s)
+                    self._log_debug(f"Forwarding Data {data_packet.name} to {host}:{port}", "data")
+                    # Use non-blocking send so we don't stall
+                    try:
+                        self.comm_module.send(data_packet.to_json(), host, port)
+                    except Exception as e:
+                        self._log_debug(f"Failed to send Data to {face}: {e}", "error")
+                except Exception as e:
+                    self._log_debug(f"Invalid face in PIT: {face} ({e})", "error")
+
+            # Clean up PIT entry only when this is the final fragment
+            try:
+                if ':[' in data_packet.name:
+                    # Parse index/total and only delete when index == total
+                    try:
+                        base_name, frag = data_packet.name.split(':[' ,1)
+                        frag_info = frag.rstrip(']')
+                        idx_s, total_s = frag_info.split('/')
+                        idx = int(idx_s)
+                        total = int(total_s)
+                    except Exception:
+                        idx = 1
+                        total = 1
+
+                    if idx >= total:
+                        # final fragment -> remove base PIT entry and fragment entry
+                        if base_name in self.pit:
+                            del self.pit[base_name]
+                        if data_packet.name in self.pit:
+                            del self.pit[data_packet.name]
+                else:
+                    # Non-fragment: safe to remove PIT entry
+                    if data_packet.name in self.pit:
+                        del self.pit[data_packet.name]
+            except Exception:
+                pass
+
         return "ACK"
     
     def _simulate_storage_response(self, interest):

@@ -125,11 +125,9 @@ class SimpleStorageNode:
                     # Check if we have all fragments
                     parts = self.fragment_accumulator[base_name]
                     if len(parts) >= total:
-                        # Reassemble in order
-                        assembled = b"".join(parts[i] for i in sorted(parts.keys()))
-
-                        # Persist assembled file
-                        storage_resp = self.storage_module.store_file(base_name, assembled)
+                        # We have all fragments; store them as fragment files instead
+                        # so that the storage preserves fragmentation on disk.
+                        storage_resp = self.storage_module.store_fragments(base_name, parts)
 
                         # Clean up accumulator
                         del self.fragment_accumulator[base_name]
@@ -261,6 +259,36 @@ class SimpleStorageNode:
         print(f"\n[{self.node_name}] === READ REQUEST ===")
         print(f"[{self.node_name}] File: {file_name}")
 
+        # If the Interest explicitly requests a fragment (e.g. /file:[i/total]),
+        # serve that specific fragment synchronously. This enables pull-based
+        # fragment retrieval by clients and avoids relying on async fragment
+        # delivery which can be lost in some network setups.
+        from common import parse_fragment_notation
+        frag_req = parse_fragment_notation(interest.name)
+        if frag_req and frag_req.get('is_fragment'):
+            base_name = frag_req['base_name']
+            try:
+                idx = int(frag_req['index'])
+            except Exception:
+                idx = 1
+
+            # Retrieve full content and return only the requested fragment
+            storage_response = self.storage_module.retrieve_file(base_name)
+            if storage_response.success:
+                content_bytes = storage_response.content
+                frag_size = getattr(self.storage_module, 'fragment_size', 1024)
+                fragments = [content_bytes[i:i + frag_size] for i in range(0, len(content_bytes), frag_size)]
+                total = len(fragments)
+                if 1 <= idx <= total:
+                    chunk = fragments[idx-1]
+                    frag_name = f"{base_name}:[{idx}/{total}]"
+                    pkt = DataPacket(name=frag_name, data_payload=chunk, data_length=len(chunk))
+                    return pkt.to_json()
+                else:
+                    return self._create_error_response(f"Fragment index out of range: {idx}")
+
+            # If retrieval failed, fall through to error handling below
+
         # Try Storage Module first (RAID-processed files)
         storage_response = self.storage_module.retrieve_file(file_name)
 
@@ -305,7 +333,7 @@ class SimpleStorageNode:
                         # Send remaining fragments asynchronously if we have a valid host/port
                         if host and dest_port:
                             try:
-                                self.comm_module.send(pkt_json, host, dest_port)
+                                self._send_fragment_with_backpressure(pkt_json, host, dest_port)
                             except Exception as e:
                                 print(f"[{self.node_name}][COMM] Failed to send fragment {idx}/{total} to {host}:{dest_port}: {e}")
 
@@ -351,7 +379,7 @@ class SimpleStorageNode:
                     else:
                         if host and dest_port:
                             try:
-                                self.comm_module.send(pkt_json, host, dest_port)
+                                self._send_fragment_with_backpressure(pkt_json, host, dest_port)
                             except Exception as e:
                                 print(f"[{self.node_name}][COMM] Failed to send fragment {idx}/{total} to {host}:{dest_port}: {e}")
 
@@ -446,6 +474,38 @@ RAID Level: {self.raid_level}"""
         
         self.stats["files_stored"] = len(test_files)
         print(f"[{self.node_name}] Pre-loaded {len(test_files)} test files")
+
+    def _send_fragment_with_backpressure(self, pkt_json: str, host: str, port: int, timeout: float = 5.0):
+        """Send fragment while respecting comm_module send buffer capacity.
+
+        This waits briefly if the send buffer is full to avoid "Send buffer overflow"
+        messages and dropped fragments. It will wait up to `timeout` seconds
+        before raising an exception.
+        """
+        start = time.time()
+        # Poll for available buffer space
+        while True:
+            try:
+                status = self.comm_module.get_buffer_status()
+                send_q = status.get('send_buffer_size', 0)
+                max_q = status.get('max_buffer_size', 100)
+                # If there's reasonable headroom, enqueue
+                if send_q < max_q - 5:
+                    self.comm_module.send(pkt_json, host, port)
+                    return
+                else:
+                    # Sleep a short while to let sender drain
+                    time.sleep(0.01)
+            except Exception:
+                # If we cannot query buffer status, just send with a tiny pause
+                try:
+                    self.comm_module.send(pkt_json, host, port)
+                    return
+                except Exception:
+                    time.sleep(0.01)
+
+            if time.time() - start > timeout:
+                raise TimeoutError(f"Timeout sending fragment to {host}:{port}")
     
     def _create_data_response(self, name: str, content):
         """Create Data packet response. `content` may be `str` or `bytes`."""

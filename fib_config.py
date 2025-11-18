@@ -30,27 +30,30 @@ def get_fib_config(router_name: str):
     
     configs = {
         "R1": [
-            # Router1 FIB - Connects to Clients and Router2
-            # All content is forwarded to Router2 (the hub connecting to server/storage)
-            ("/dlsu/router2", "127.0.0.1:8002", "eth1", 1),  # Direct to R2
-            ("/dlsu/server", "127.0.0.1:8002", "eth1", 2),   # Via R2
-            ("/dlsu/storage/node1", "127.0.0.1:8002", "eth1", 3),  # Via R2
-            ("/dlsu/storage/node2", "127.0.0.1:8002", "eth1", 3),  # Via R2
-            ("/dlsu/storage", "127.0.0.1:8002", "eth1", 3),  # Via R2
-            ("/dlsu/alice", "127.0.0.1:8002", "eth1", 3),    # Via R2 (user files)
-            ("/dlsu/bob", "127.0.0.1:8002", "eth1", 3),      # Via R2 (user files)
-            ("/dlsu", "127.0.0.1:8002", "eth1", 2),          # Default: everything goes to R2
+            # Router1 FIB - Edge router connecting clients (Alice/Bob) and R2
+            # Client prefixes point to local clients; other prefixes forward to R2
+            ("/dlsu/alice", "127.0.0.1:6001", "eth0", 1),    # Alice (client)
+            ("/dlsu/bob", "127.0.0.1:6002", "eth0", 1),      # Bob (client)
+            ("/dlsu/router2", "127.0.0.1:8002", "eth1", 1),  # To R2 (core)
+            ("/dlsu/server", "127.0.0.1:8002", "eth1", 2),   # Via R2 to server
+            ("/dlsu/storage/node1", "127.0.0.1:8002", "eth1", 2),  # Via R2
+            ("/dlsu/storage/node2", "127.0.0.1:8002", "eth1", 2),  # Via R2
+            ("/dlsu/storage", "127.0.0.1:8002", "eth1", 2),  # Default storage via R2
+            ("/dlsu", "127.0.0.1:8002", "eth1", 2),          # Default: forward to R2
         ],
         
         "R2": [
-            # Router2 FIB - Connects to R1, Server, and Storage Nodes
-            ("/dlsu/router1", "127.0.0.1:8001", "eth0", 1),  # Back to R1 (for responses)
-            ("/dlsu/server", "127.0.0.1:7001", "eth2", 1),   # Direct to Server
-            ("/dlsu/storage/node1", "127.0.0.1:9001", "eth3", 1),  # Direct to ST1
-            ("/dlsu/storage/node2", "127.0.0.1:9002", "eth4", 1),  # Direct to ST2
-            ("/dlsu/storage", "127.0.0.1:9001", "eth3", 1),  # Default storage -> ST1
-            ("/dlsu/alice", "127.0.0.1:9001", "eth3", 1),    # Alice's files on ST1
-            ("/dlsu/bob", "127.0.0.1:9002", "eth4", 1),      # Bob's files on ST2
+            # Router2 FIB - Core router connecting R1, Server and Storage nodes
+            ("/dlsu/router1", "127.0.0.1:8001", "eth0", 1),  # Back to R1
+            ("/dlsu/server", "127.0.0.1:7001", "eth1", 1),   # Direct to Server
+            ("/dlsu/storage/node1", "127.0.0.1:9001", "eth2", 1),  # Direct to ST1
+            ("/dlsu/storage/node2", "127.0.0.1:9002", "eth3", 1),  # Direct to ST2
+            # Default storage entries (both nodes) so lookup can round-robin
+            ("/dlsu/storage", "127.0.0.1:9001", "eth2", 1),
+            ("/dlsu/storage", "127.0.0.1:9002", "eth3", 1),
+            # Client prefixes reachable via R1 (so replies are forwarded back)
+            ("/dlsu/alice", "127.0.0.1:8001", "eth0", 2),
+            ("/dlsu/bob", "127.0.0.1:8001", "eth0", 2),
         ]
     }
     

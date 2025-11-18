@@ -172,15 +172,21 @@ class CommunicationModule:
                 # Get packet from send buffer
                 packet, host, port = self.send_buffer.get(timeout=1.0)
                 
-                # Send via UDP (creates temporary socket for each send)
+                # Send via UDP. Prefer using the bound server socket so the
+                # source port is the module's listening port (avoids ephemeral
+                # source ports which break reply routing). Fall back to a
+                # temporary socket if server_socket isn't available.
                 try:
-                    client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    client_socket.sendto(packet.encode('utf-8'), (host, port))
-                    client_socket.close()
-                    
+                    if self.server_socket:
+                        self.server_socket.sendto(packet.encode('utf-8'), (host, port))
+                    else:
+                        client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        client_socket.sendto(packet.encode('utf-8'), (host, port))
+                        client_socket.close()
+
                     self.stats["packets_sent"] += 1
                     print(f"[{self.node_name}][COMM] Sent packet to {host}:{port}")
-                    
+
                 except Exception as e:
                     self.stats["errors"] += 1
                     print(f"[{self.node_name}][COMM] Send error to {host}:{port}: {e}")
