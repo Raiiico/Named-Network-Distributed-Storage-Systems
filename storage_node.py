@@ -125,6 +125,9 @@ class SimpleStorageNode:
                     # Check if we have all fragments
                     parts = self.fragment_accumulator[base_name]
                     if len(parts) >= total:
+                        # Calculate total size
+                        total_size = sum(len(chunk) for chunk in parts.values())
+                        
                         # We have all fragments; store them as fragment files instead
                         # so that the storage preserves fragmentation on disk.
                         storage_resp = self.storage_module.store_fragments(base_name, parts)
@@ -134,15 +137,19 @@ class SimpleStorageNode:
 
                         if storage_resp.success:
                             self.stored_files[base_name] = {
-                                "content": assembled,
+                                "content": b'',  # Don't store full content in memory
                                 "stored_at": time.strftime('%Y-%m-%d %H:%M:%S'),
                                 "checksum": storage_resp.metadata.checksum if storage_resp.metadata else "",
-                                "size": len(assembled),
+                                "size": total_size,
                                 "user": uploader if uploader else "uploader",
                                 "raid_processed": True
                             }
                             self.stats["files_stored"] += 1
-                            self.stats["bytes_stored"] += len(assembled)
+                            self.stats["bytes_stored"] += total_size
+
+                            # Notify auth server to create ACL
+                            if uploader:
+                                self._notify_auth_server_ownership(base_name, uploader)
 
                             # Write metadata JSON so stored files are discoverable on disk
                             try:
@@ -155,7 +162,7 @@ class SimpleStorageNode:
                                     "original_name": base_name,
                                     "stored_path": stored_path,
                                     "checksum": storage_resp.metadata.checksum if storage_resp.metadata else "",
-                                    "size": len(assembled),
+                                    "size": total_size,
                                     "stored_at": time.strftime('%Y-%m-%d %H:%M:%S')
                                 }
                                 with open(meta_path, 'w', encoding='utf-8') as mf:
@@ -194,6 +201,10 @@ class SimpleStorageNode:
 
                 self.stats["files_stored"] += 1
                 self.stats["bytes_stored"] += len(content_bytes)
+
+                # Notify auth server to create ACL
+                if uploader:
+                    self._notify_auth_server_ownership(file_name, uploader)
 
                 # Write metadata JSON so stored files are discoverable on disk
                 try:
@@ -569,6 +580,26 @@ RAID Level: {self.raid_level}"""
         self._show_stats()
         
         print(f"[{self.node_name}] Storage node stopped")
+    
+    def _notify_auth_server_ownership(self, file_name: str, owner: str, server_host: str = '127.0.0.1', server_port: int = 7001):
+        """Notify authentication server that a file was uploaded to create ACL"""
+        import json
+        
+        # Strip fragment notation to register only the base filename
+        base_name = file_name.split(':[')[0] if ':[' in file_name else file_name
+        
+        payload = {
+            "action": "register_file",
+            "resource": base_name,
+            "owner": owner
+        }
+        req = json.dumps(payload)
+        try:
+            resp = self.comm_module.send_packet_sync(server_host, server_port, req)
+            if resp:
+                print(f"[{self.node_name}] ACL created for {base_name} (owner: {owner})")
+        except Exception as e:
+            print(f"[{self.node_name}] Warning: Could not register file ownership: {e}")
     
     def _show_stats(self):
         """Display storage statistics"""

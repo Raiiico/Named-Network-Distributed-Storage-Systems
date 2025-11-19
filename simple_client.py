@@ -13,8 +13,10 @@ from communication_module import CommunicationModule
 class SimpleClient:
     """Simple client for testing with fixed UDP communication"""
     
-    def __init__(self, client_id: str):
+    def __init__(self, client_id: str, password: str = None):
         self.client_id = client_id
+        self.password = password
+        self.authenticated = False
         self.node_name = f"Client-{client_id}"
         self.comm_module = CommunicationModule(self.node_name, port=0)
         
@@ -213,11 +215,14 @@ class SimpleClient:
         print(f"INTERACTIVE MODE - {self.node_name} (UDP)")
         print(f"{'='*70}")
         print(f"Router: {router_host}:{router_port}")
+        print(f"Authenticated: {'✓' if self.authenticated else '✗'}")
         print(f"\nCommands:")
         print(f"  read <name>       - Download file (sends READ interest)")
         print(f"  write <name>      - Upload file (prompts for local path, performs WRITE)")
         print(f"  permission <name> - Send PERMISSION Interest")
-        # 'download' command removed; use 'read <name>' which saves to downloaded_files/
+        print(f"  grant <file> <user> - Grant READ access to another user")
+        print(f"  revoke <file> <user> - Revoke access from a user")
+        print(f"  myfiles           - List files you own")
         print(f"  concurrent        - Run concurrent test")
         print(f"  stats             - Show statistics")
         print(f"  quit              - Exit")
@@ -253,20 +258,17 @@ class SimpleClient:
                     operation = cmd.lower()
                     if operation == 'permission':
                         # Simple permission check against auth server
-                        pwd = input(f"Password for {self.client_id} (blank to skip): ")
-                        ok = self._check_permission(name, 'READ', password=pwd)
+                        ok = self._check_permission(name, 'READ', password=self.password)
                         print(f"Permission check: {'AUTHORIZED' if ok else 'DENIED'}")
                     elif operation == 'read':
                         # Download file (requires permission)
-                        pwd = input(f"Password for {self.client_id} (blank to skip): ")
-                        self._do_read(name, router_host, router_port, password=pwd)
+                        self._do_read(name, router_host, router_port, password=self.password)
                     elif operation == 'write':
                         # Upload file: prompt local path and destination (name)
                         local_path = input('Local file path to upload: ').strip()
                         if not local_path:
                             print('Upload cancelled')
                             continue
-                        pwd = input(f"Password for {self.client_id} (blank to skip): ")
                         # Ask for storage host/port (optional)
                         storage = input(f"Storage host:port [127.0.0.1:9001]: ").strip() or '127.0.0.1:9001'
                         try:
@@ -276,17 +278,48 @@ class SimpleClient:
                             print('Invalid storage address, using 127.0.0.1:9001')
                             shost, sport = '127.0.0.1', 9001
 
-                        self._do_write(local_path, name, shost, sport, password=pwd)
-                # upload/download commands removed; use 'write' and 'read'
+                        self._do_write(local_path, name, shost, sport, password=self.password)
+                
+                elif cmd == "grant":
+                    if len(parts) < 2:
+                        print("  Usage: grant <file> <user>")
+                        print("  Example: grant /files/doc.txt bob")
+                        continue
+                    args = parts[1].split()
+                    if len(args) < 2:
+                        print("  Usage: grant <file> <user>")
+                        continue
+                    file_name = args[0]
+                    target_user = args[1]
+                    self._grant_permission(file_name, target_user)
+                
+                elif cmd == "revoke":
+                    if len(parts) < 2:
+                        print("  Usage: revoke <file> <user>")
+                        print("  Example: revoke /files/doc.txt bob")
+                        continue
+                    args = parts[1].split()
+                    if len(args) < 2:
+                        print("  Usage: revoke <file> <user>")
+                        continue
+                    file_name = args[0]
+                    target_user = args[1]
+                    self._revoke_permission(file_name, target_user)
+                
+                elif cmd == "myfiles":
+                    self._list_my_files()
                 
                 elif cmd == "help":
                     print("\nAvailable commands:")
-                    print("  read <name>       - Request content")
-                    print("  write <name>      - Write content")
-                    print("  permission <name> - Check permissions")
-                    print("  concurrent        - Test concurrent requests")
-                    print("  stats             - Show statistics")
-                    print("  quit              - Exit client")
+                    print("  read <name>          - Request content")
+                    print("  write <name>         - Write content")
+                    print("  permission <name>    - Check permissions")
+                    print("  grant <file> <user>  - Grant access to user")
+                    print("  revoke <file> <user> - Revoke user access")
+                    print("  myfiles              - List your files")
+                    print("  concurrent           - Test concurrent requests")
+                    print("  stats                - Show statistics")
+                    print("  quit                 - Exit client")
                 
                 else:
                     print(f"Unknown command: {cmd}")
@@ -301,11 +334,69 @@ class SimpleClient:
             except Exception as e:
                 print(f"Error: {e}")
     
+    def _grant_permission(self, file_name: str, target_user: str, server_host: str = '127.0.0.1', server_port: int = 7001):
+        """Grant READ permission to another user on your file"""
+        import json
+        payload = {
+            "action": "grant",
+            "resource": file_name,
+            "owner": self.client_id,
+            "target_user": target_user,
+            "password": self.password
+        }
+        req = json.dumps(payload)
+        resp = self.comm_module.send_packet_sync(server_host, server_port, req)
+        if resp:
+            # send_packet_sync returns a string
+            print(f"✓ {resp}")
+        else:
+            print("✗ No response from server")
+    
+    def _revoke_permission(self, file_name: str, target_user: str, server_host: str = '127.0.0.1', server_port: int = 7001):
+        """Revoke permission from another user on your file"""
+        import json
+        payload = {
+            "action": "revoke",
+            "resource": file_name,
+            "owner": self.client_id,
+            "target_user": target_user,
+            "password": self.password
+        }
+        req = json.dumps(payload)
+        resp = self.comm_module.send_packet_sync(server_host, server_port, req)
+        if resp:
+            # send_packet_sync returns a string
+            print(f"✓ {resp}")
+        else:
+            print("✗ No response from server")
+    
+    def _list_my_files(self, server_host: str = '127.0.0.1', server_port: int = 7001):
+        """List files owned by this user"""
+        import json
+        payload = {
+            "action": "list_owned",
+            "user_id": self.client_id,
+            "password": self.password
+        }
+        req = json.dumps(payload)
+        resp = self.comm_module.send_packet_sync(server_host, server_port, req)
+        if resp:
+            # send_packet_sync returns a string
+            print(f"\n{'='*70}")
+            print(f"MY FILES ({self.client_id})")
+            print(f"{'='*70}")
+            print(resp)
+            print(f"{'='*70}\n")
+        else:
+            print("✗ No response from server")
+    
     def _show_statistics(self):
         """Display statistics"""
         print(f"\n{'='*70}")
         print(f"CLIENT STATISTICS - {self.node_name}")
         print(f"{'='*70}")
+        print(f"  User:               {self.client_id}")
+        print(f"  Authenticated:      {'✓' if self.authenticated else '✗'}")
         print(f"  Protocol:           UDP")
         print(f"  Interests Sent:     {self.stats['interests_sent']}")
         print(f"  Data Received:      {self.stats['data_received']}")
@@ -337,16 +428,11 @@ class SimpleClient:
             print("Permission check: timeout contacting auth server")
             return False
 
-        # Response may be plain text containing AUTHORIZED or DENIED, or JSON
-        try:
-            rstr = resp.decode('utf-8') if isinstance(resp, bytes) else str(resp)
-        except Exception:
-            rstr = str(resp)
-
-        if 'AUTHORIZED' in rstr.upper() or 'AUTHORIZED' in rstr:
+        # send_packet_sync returns a string
+        if 'AUTHORIZED' in resp.upper() or 'AUTHORIZED' in resp:
             return True
         try:
-            robj = json.loads(rstr)
+            robj = json.loads(resp)
             return bool(robj.get('authorized'))
         except Exception:
             return False
@@ -617,8 +703,38 @@ def main():
     print(f"\n{'#'*70}")
     print(f"# NAMED NETWORKS CLIENT (UDP)")
     print(f"{'#'*70}")
+    print(f"\nUser: {client_id}")
     
-    client = SimpleClient(client_id)
+    # Prompt for password
+    password = input(f"Password for {client_id}: ").strip()
+    if not password:
+        print("✗ Password required for authentication")
+        sys.exit(1)
+    
+    client = SimpleClient(client_id, password)
+    
+    # Authenticate with server
+    import json
+    payload = {"user_id": client_id, "password": password, "action": "authenticate"}
+    req = json.dumps(payload)
+    
+    try:
+        resp = client.comm_module.send_packet_sync('127.0.0.1', 7001, req)
+        if resp:
+            # send_packet_sync already returns a decoded string
+            if 'AUTHORIZED' in resp or 'SUCCESS' in resp.upper():
+                client.authenticated = True
+                print(f"✓ Authentication successful")
+            else:
+                print(f"✗ Authentication failed: {resp}")
+                sys.exit(1)
+        else:
+            print("✗ No response from authentication server")
+            print("   Make sure server.py is running: python server.py S1")
+            sys.exit(1)
+    except Exception as e:
+        print(f"✗ Authentication error: {e}")
+        sys.exit(1)
     
     router_host = "127.0.0.1"
     router_port = 8001

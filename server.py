@@ -877,20 +877,136 @@ class AuthenticationServer:
 
     def _serve_forever(self):
         import json
+        print(f"[AuthServer] Server thread started")
         while self._running:
             try:
+                print(f"[AuthServer] Waiting for data...")
                 data, addr = self.socket.recvfrom(65536)
+                print(f"[AuthServer] Received {len(data)} bytes from {addr}")
                 try:
                     req = json.loads(data.decode('utf-8'))
-                except Exception:
+                    print(f"[AuthServer] Parsed request: {req}")
+                except Exception as e:
+                    print(f"[AuthServer] JSON parse error: {e}")
                     # Fallback: treat as plain text command
                     req = {}
 
+                action = req.get('action', '').lower()
                 resource = req.get('name') or req.get('resource') or req.get('resource_name')
                 user_id = req.get('user_id') or req.get('user')
                 password = req.get('password')
                 operation = req.get('operation') or req.get('op') or 'READ'
 
+                # Handle different actions
+                if action == 'authenticate':
+                    # Simple authentication
+                    if user_id and password:
+                        auth = self.security.authenticate_user(user_id, password)
+                        if auth.success:
+                            resp_text = f"AUTHORIZED: Authentication successful for {user_id}"
+                        else:
+                            resp_text = f"DENIED: {auth.message}"
+                    else:
+                        resp_text = "DENIED: Missing user_id or password"
+                    self.socket.sendto(resp_text.encode('utf-8'), addr)
+                    continue
+
+                elif action == 'grant':
+                    # Grant permission: owner grants target_user access to resource
+                    owner = req.get('owner')
+                    target_user = req.get('target_user')
+                    if not all([owner, target_user, resource, password]):
+                        resp_text = "DENIED: Missing parameters (owner, target_user, resource, password)"
+                        self.socket.sendto(resp_text.encode('utf-8'), addr)
+                        continue
+                    
+                    # Authenticate owner
+                    auth = self.security.authenticate_user(owner, password)
+                    if not auth.success:
+                        resp_text = f"DENIED: Authentication failed for {owner}"
+                        self.socket.sendto(resp_text.encode('utf-8'), addr)
+                        continue
+                    
+                    # Grant READ permission
+                    from security_module import PermissionLevel
+                    result = self.security.grant_permission(resource, target_user, PermissionLevel.READ.value, owner)
+                    if result.success:
+                        resp_text = f"SUCCESS: Granted READ access to {target_user} on {resource}"
+                    else:
+                        resp_text = f"FAILED: {result.message}"
+                    self.socket.sendto(resp_text.encode('utf-8'), addr)
+                    continue
+
+                elif action == 'revoke':
+                    # Revoke permission
+                    owner = req.get('owner')
+                    target_user = req.get('target_user')
+                    if not all([owner, target_user, resource, password]):
+                        resp_text = "DENIED: Missing parameters"
+                        self.socket.sendto(resp_text.encode('utf-8'), addr)
+                        continue
+                    
+                    auth = self.security.authenticate_user(owner, password)
+                    if not auth.success:
+                        resp_text = f"DENIED: Authentication failed"
+                        self.socket.sendto(resp_text.encode('utf-8'), addr)
+                        continue
+                    
+                    result = self.security.revoke_permission(resource, target_user, owner)
+                    if result.success:
+                        resp_text = f"SUCCESS: Revoked access for {target_user} on {resource}"
+                    else:
+                        resp_text = f"FAILED: {result.message}"
+                    self.socket.sendto(resp_text.encode('utf-8'), addr)
+                    continue
+
+                elif action == 'list_owned':
+                    # List files owned by user
+                    if not user_id or not password:
+                        resp_text = "DENIED: Missing user_id or password"
+                        self.socket.sendto(resp_text.encode('utf-8'), addr)
+                        continue
+                    
+                    auth = self.security.authenticate_user(user_id, password)
+                    if not auth.success:
+                        resp_text = f"DENIED: Authentication failed"
+                        self.socket.sendto(resp_text.encode('utf-8'), addr)
+                        continue
+                    
+                    # Get user's files
+                    owned_files = []
+                    for res_name, acl in self.security.resource_acls.items():
+                        if acl.owner == user_id:
+                            owned_files.append(res_name)
+                    
+                    if owned_files:
+                        resp_text = "\n".join(f"  - {f}" for f in owned_files)
+                    else:
+                        resp_text = "  No files owned"
+                    self.socket.sendto(resp_text.encode('utf-8'), addr)
+                    continue
+                
+                elif action == 'register_file':
+                    # Register file ownership (from storage node)
+                    owner = req.get('owner')
+                    if not resource or not owner:
+                        resp_text = "DENIED: Missing resource or owner"
+                        self.socket.sendto(resp_text.encode('utf-8'), addr)
+                        continue
+                    
+                    # Strip fragment notation to get base name
+                    base_resource = self._strip_fragment_notation(resource)
+                    
+                    # Create ACL with owner having full permissions
+                    result = self.security.create_resource_acl(base_resource, owner)
+                    if result.success:
+                        resp_text = f"SUCCESS: ACL created for {base_resource} (owner: {owner})"
+                    else:
+                        resp_text = f"INFO: ACL already exists for {base_resource}"
+                    self.socket.sendto(resp_text.encode('utf-8'), addr)
+                    continue
+
+                # Default: permission check
                 # Optional authentication step using password
                 if password and user_id:
                     auth = self.security.authenticate_user(user_id, password)
@@ -905,12 +1021,16 @@ class AuthenticationServer:
                     self.socket.sendto(resp_text.encode('utf-8'), addr)
                     continue
 
-                # Check permission
-                perm = self.security.check_permission(resource, user_id, PermissionLevel.READ)
+                # Strip fragment notation to get base name for permission check
+                base_resource = self._strip_fragment_notation(resource)
+
+                # Check permission on base resource
+                from security_module import PermissionLevel
+                perm = self.security.check_permission(base_resource, user_id, PermissionLevel.READ)
                 if perm and perm.authorized:
-                    resp_text = f"AUTHORIZED: {user_id} -> {resource}"
+                    resp_text = f"AUTHORIZED: {user_id} -> {base_resource}"
                 else:
-                    resp_text = f"DENIED: {user_id} -> {resource}"
+                    resp_text = f"DENIED: {user_id} -> {base_resource}"
 
                 # Also send a JSON payload for richer clients
                 resp_obj = {
@@ -930,6 +1050,173 @@ class AuthenticationServer:
             except Exception as e:
                 print(f"[AuthServer] Error handling request: {e}")
                 continue
+    
+    def _strip_fragment_notation(self, resource_name: str) -> str:
+        """Strip fragment notation from resource name to get base name.
+        Example: /files/data.txt:[1/10] -> /files/data.txt
+        """
+        if ':[' in resource_name:
+            return resource_name.split(':[')[0]
+        return resource_name
+
+    def admin_cli(self):
+        """Interactive admin CLI for server management"""
+        print("\n" + "="*70)
+        print("ADMIN CLI - Authentication Server")
+        print("="*70)
+        print("Commands:")
+        print("  list users         - List all users")
+        print("  list files         - List all files and owners")
+        print("  list security      - Show security table (ACLs)")
+        print("  grant <file> <user> - Override and grant access")
+        print("  revoke <file> <user> - Override and revoke access")
+        print("  show passwords     - Show encrypted passwords (XOR)")
+        print("  stats              - Show security statistics")
+        print("  quit               - Stop server")
+        print("="*70 + "\n")
+        
+        while self._running:
+            try:
+                cmd = input("admin> ").strip().lower()
+                
+                if cmd in ["quit", "exit"]:
+                    break
+                
+                elif cmd == "list users":
+                    self._admin_list_users()
+                
+                elif cmd == "list files":
+                    self._admin_list_files()
+                
+                elif cmd == "list security":
+                    self._admin_list_security()
+                
+                elif cmd == "show passwords":
+                    self._admin_show_passwords()
+                
+                elif cmd == "stats":
+                    self.security.show_stats()
+                
+                elif cmd.startswith("grant"):
+                    parts = cmd.split()
+                    if len(parts) >= 3:
+                        file_name = parts[1]
+                        user = parts[2]
+                        self._admin_grant(file_name, user)
+                    else:
+                        print("Usage: grant <file> <user>")
+                
+                elif cmd.startswith("revoke"):
+                    parts = cmd.split()
+                    if len(parts) >= 3:
+                        file_name = parts[1]
+                        user = parts[2]
+                        self._admin_revoke(file_name, user)
+                    else:
+                        print("Usage: revoke <file> <user>")
+                
+                elif cmd == "help" or cmd == "?":
+                    print("\\nAvailable commands:")
+                    print("  list users, list files, list security")
+                    print("  grant <file> <user>, revoke <file> <user>")
+                    print("  show passwords, stats, quit")
+                
+                elif cmd:
+                    print(f"Unknown command: {cmd}. Type 'help' for commands.")
+            
+            except (KeyboardInterrupt, EOFError):
+                print()
+                break
+            except Exception as e:
+                print(f"Error: {e}")
+    
+    def _admin_list_users(self):
+        """List all users"""
+        print("\n" + "="*70)
+        print("USERS")
+        print("="*70)
+        if not self.security.users:
+            print("  No users")
+        else:
+            for user_id, user in self.security.users.items():
+                status = "Active" if user.is_active else "Inactive"
+                groups = ", ".join(user.groups) if user.groups else "None"
+                print(f"  {user_id:15} | {status:8} | Groups: {groups}")
+        print("="*70 + "\n")
+    
+    def _admin_list_files(self):
+        """List all files and their owners"""
+        print("\n" + "="*70)
+        print("FILES AND OWNERS")
+        print("="*70)
+        if not self.security.resource_acls:
+            print("  No files tracked")
+        else:
+            for res_name, acl in self.security.resource_acls.items():
+                public = " (PUBLIC)" if acl.is_public else ""
+                print(f"  {res_name:40} | Owner: {acl.owner}{public}")
+        print("="*70 + "\n")
+    
+    def _admin_list_security(self):
+        """Show complete security table (ACLs)"""
+        print("\n" + "="*70)
+        print("SECURITY TABLE (Access Control Lists)")
+        print("="*70)
+        if not self.security.resource_acls:
+            print("  No ACLs")
+        else:
+            for res_name, acl in self.security.resource_acls.items():
+                print(f"\nResource: {res_name}")
+                print(f"  Owner: {acl.owner}")
+                print(f"  Public: {acl.is_public}")
+                print(f"  ACL Entries:")
+                if not acl.acl_entries:
+                    print("    (none)")
+                else:
+                    for uid, ace in acl.acl_entries.items():
+                        perms = []
+                        if ace.permissions & 1: perms.append("READ")
+                        if ace.permissions & 2: perms.append("WRITE")
+                        if ace.permissions & 4: perms.append("EXECUTE")
+                        perm_str = ", ".join(perms) if perms else "NONE"
+                        print(f"    {uid:15} | Permissions: {perm_str} | Granted by: {ace.granted_by}")
+        print("="*70 + "\n")
+    
+    def _admin_show_passwords(self):
+        """Show encrypted passwords using XOR encryption"""
+        print("\n" + "="*70)
+        print("ENCRYPTED PASSWORDS (XOR)")
+        print("="*70)
+        if not self.security.users:
+            print("  No users")
+        else:
+            for user_id, user in self.security.users.items():
+                # XOR encrypt the password hash for display
+                pwd_bytes = user.password_hash.encode('utf-8')
+                encrypted = self.security.encrypt_data(pwd_bytes)
+                if encrypted.success:
+                    enc_display = encrypted.encrypted_data[:40].decode('utf-8', errors='ignore')
+                    print(f"  {user_id:15} | {enc_display}...")
+                else:
+                    print(f"  {user_id:15} | (encryption failed)")
+        print("="*70 + "\n")
+    
+    def _admin_grant(self, file_name: str, user: str):
+        """Admin override to grant permission"""
+        from security_module import PermissionLevel
+        result = self.security.grant_permission(file_name, user, PermissionLevel.READ.value, "admin")
+        if result.success:
+            print(f"✓ Granted READ access to {user} on {file_name}")
+        else:
+            print(f"✗ Failed: {result.message}")
+    
+    def _admin_revoke(self, file_name: str, user: str):
+        """Admin override to revoke permission"""
+        result = self.security.revoke_permission(file_name, user, "admin")
+        if result.success:
+            print(f"✓ Revoked access for {user} on {file_name}")
+        else:
+            print(f"✗ Failed: {result.message}")
 
 
 if __name__ == "__main__":
@@ -941,12 +1228,18 @@ if __name__ == "__main__":
         srv = AuthenticationServer(host, port)
         try:
             srv.start()
-            print("Authentication server started. Press Ctrl-C to stop.")
-            while True:
-                try:
-                    time.sleep(1)
-                except KeyboardInterrupt:
-                    break
+            print("="*70)
+            print("Authentication Server Started")
+            print("="*70)
+            print(f"Listening on {host}:{port}")
+            print("Starting admin CLI interface...")
+            print("="*70 + "\n")
+            
+            # Run admin CLI
+            srv.admin_cli()
+            
+        except KeyboardInterrupt:
+            print("\nShutting down...")
         finally:
             srv.stop()
             print("Authentication server stopped")
