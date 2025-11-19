@@ -544,7 +544,11 @@ Statistics Summary:
             timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
             self.root.after(0, self.log, f"[{timestamp}] Content: {content_name}", 'info')
             self.root.after(0, self.log, f"[{timestamp}] User: {self.client_id}", 'info')
-            self.root.after(0, self.log, f"[{timestamp}] Nonce: {interest.nonce}", 'info')
+            # Nonce was removed from packet structure; log checksum if nonce absent
+            if hasattr(interest, 'nonce'):
+                self.root.after(0, self.log, f"[{timestamp}] Nonce: {interest.nonce}", 'info')
+            else:
+                self.root.after(0, self.log, f"[{timestamp}] Checksum: {interest.checksum}", 'info')
             
             self.stats['sent'] += 1
             self.root.after(0, self.update_stats)
