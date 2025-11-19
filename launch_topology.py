@@ -49,12 +49,12 @@ class TopologyLauncher:
             },
             "client_alice": {
                 "script": "simple_client.py",  # or simple_client.py
-                "args": ["Alice"],
+                "args": ["alice"],
                 "wait": 1
             },
             "client_bob": {
                 "script": "simple_client.py",  # or simple_client.py
-                "args": ["Bob"],
+                "args": ["bob"],
                 "wait": 1
             }
         }
