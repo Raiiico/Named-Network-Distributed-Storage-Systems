@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Named Networks Framework - Common Components
-Standardized checksum implementation to fix mismatch warnings
+FIXED: Nonce removed per adviser feedback
 """
 
 import json
@@ -19,36 +19,59 @@ class PacketType(Enum):
 
 @dataclass
 class InterestPacket:
-    """Interest packet for Named Networks - Storage Protocol Extension"""
+    """Interest packet for Named Networks - Storage Protocol Extension
+
+    Extended to support direct-reply addresses (`reply_host` and `reply_port`)
+    so a requester can indicate where to receive pushed fragments. Also includes
+    an optional `reply_tcp_port` field that allows clients to advertise a TCP
+    listener port for reliable large-file transfers (TCP fallback).
+    """
     packet_type: str = "INTEREST"
     name: str = ""                    # Hierarchical content name
     user_id: str = ""                 # User identifier
     operation: str = "READ"           # READ, WRITE, PERMISSION
     auth_key: Optional[str] = None    # One-time authentication key
-    nonce: int = 0                    # Duplicate detection
+    reply_host: Optional[str] = None  # Optional host where replies should be pushed (UDP)
+    reply_port: Optional[int] = None  # Optional port where replies should be pushed (UDP)
+    reply_tcp_host: Optional[str] = None # Optional TCP host for large transfers (preserve client host)
+    reply_tcp_port: Optional[int] = None  # Optional TCP port for large transfers
     checksum: str = ""                # Packet integrity
+    # Optional target resource for special Interests (e.g., auth checks)
+    target: Optional[str] = None
     
     def to_json(self):
         """Serialize to JSON with standardized checksum"""
-        # Calculate checksum from deterministic content
-        checksum_content = f"{self.name}|{self.user_id}|{self.operation}|{self.nonce}"
+        # Include reply addresses in checksum if present for integrity
+        parts = []
+        if self.reply_host and self.reply_port:
+            parts.append(f"{self.reply_host}:{self.reply_port}")
+        if self.reply_tcp_host and self.reply_tcp_port:
+            parts.append(f"tcp:{self.reply_tcp_host}:{self.reply_tcp_port}")
+        reply_part = "|" + ":".join(parts) if parts else ""
+        checksum_content = f"{self.name}|{self.user_id}|{self.operation}{reply_part}"
         self.checksum = calculate_checksum(checksum_content)
         
-        return json.dumps({
+        obj = {
             "type": self.packet_type,
             "name": self.name,
             "user_id": self.user_id,
             "operation": self.operation,
             "auth_key": self.auth_key,
-            "nonce": self.nonce,
+            "reply_host": self.reply_host,
+            "reply_port": self.reply_port,
+            "reply_tcp_host": self.reply_tcp_host,
+            "reply_tcp_port": self.reply_tcp_port,
             "checksum": self.checksum
-        })
+        }
+        if self.target:
+            obj["target"] = self.target
+        return json.dumps(obj)
     
     @classmethod
     def from_json(cls, json_str):
         """Deserialize from JSON with checksum validation"""
         data = json.loads(json_str)
-        
+
         # Create packet
         packet = cls(
             packet_type=data.get("type", "INTEREST"),
@@ -56,26 +79,53 @@ class InterestPacket:
             user_id=data.get("user_id", ""),
             operation=data.get("operation", "READ"),
             auth_key=data.get("auth_key"),
-            nonce=data.get("nonce", 0),
-            checksum=data.get("checksum", "")
+            reply_host=data.get("reply_host"),
+            reply_port=data.get("reply_port"),
+            reply_tcp_host=data.get("reply_tcp_host"),
+            reply_tcp_port=data.get("reply_tcp_port"),
+            checksum=data.get("checksum", ""),
+            target=data.get("target")
         )
-        
+
         return packet
+
+    def to_bytes(self) -> bytes:
+        """Serialize to bytes for UDP send"""
+        return self.to_json().encode('utf-8')
+
+    @classmethod
+    def from_bytes(cls, b: bytes):
+        """Deserialize from bytes"""
+        return cls.from_json(b.decode('utf-8'))
     
     def validate_checksum(self) -> bool:
         """Validate packet checksum"""
-        expected_content = f"{self.name}|{self.user_id}|{self.operation}|{self.nonce}"
+        parts = []
+        if self.reply_host and self.reply_port:
+            parts.append(f"{self.reply_host}:{self.reply_port}")
+        if self.reply_tcp_port:
+            parts.append(f"tcp:{self.reply_tcp_port}")
+        reply_part = "|" + ":".join(parts) if parts else ""
+        expected_content = f"{self.name}|{self.user_id}|{self.operation}{reply_part}"
         expected_checksum = calculate_checksum(expected_content)
         return self.checksum == expected_checksum
 
 @dataclass
 class DataPacket:
-    """Data packet for Named Networks responses"""
+    """Data packet for Named Networks responses
+
+    Extended with optional push metadata to help detect and avoid forwarding loops
+    when storage pushes fragments over UDP. Fields:
+      - hop_count: increments at each forwarding hop
+      - push_id: unique identifier for a particular push transfer
+    """
     packet_type: str = "DATA"
     name: str = ""                    # Content name
     data_payload: bytes = b""         # Actual content
     data_length: int = 0              # Payload length
     checksum: str = ""                # Content checksum
+    hop_count: int = 0                 # Optional hop-count for push-loop detection
+    push_id: Optional[str] = None      # Optional push session id (UUID)
     
     def to_json(self):
         """Serialize to JSON with standardized checksum"""
@@ -92,13 +142,18 @@ class DataPacket:
         import base64
         payload_b64 = base64.b64encode(self.data_payload).decode('utf-8')
         
-        return json.dumps({
+        obj = {
             "type": self.packet_type,
             "name": self.name,
             "data_payload": payload_b64,
             "data_length": self.data_length,
-            "checksum": self.checksum
-        })
+            "checksum": self.checksum,
+            "hop_count": getattr(self, 'hop_count', 0)
+        }
+        if getattr(self, 'push_id', None):
+            obj["push_id"] = self.push_id
+        
+        return json.dumps(obj)
     
     @classmethod
     def from_json(cls, json_str):
@@ -123,7 +178,9 @@ class DataPacket:
             name=data.get("name", ""),
             data_payload=payload_bytes,
             data_length=data.get("data_length", len(payload_bytes)),
-            checksum=data.get("checksum", "")
+            checksum=data.get("checksum", ""),
+            hop_count=data.get("hop_count", 0),
+            push_id=data.get("push_id")
         )
     
     def validate_checksum(self) -> bool:
@@ -135,6 +192,26 @@ class DataPacket:
         
         expected_checksum = calculate_checksum(payload_str)
         return self.checksum == expected_checksum
+
+    def to_dict(self) -> dict:
+        """Dictionary representation of DataPacket"""
+        return {
+            "type": self.packet_type,
+            "name": self.name,
+            "data_length": self.data_length,
+            "checksum": self.checksum,
+            "hop_count": self.hop_count,
+            "push_id": getattr(self, 'push_id', None)
+        }
+
+    def to_bytes(self) -> bytes:
+        """Serialize to bytes"""
+        return self.to_json().encode('utf-8')
+
+    @classmethod
+    def from_bytes(cls, b: bytes):
+        """Deserialize from bytes"""
+        return cls.from_json(b.decode('utf-8'))
 
 class ContentStore:
     """Content Store - caches named data"""
@@ -199,14 +276,9 @@ class PendingInterestTable:
         with self._lock:
             return len(self.table)
 
-def generate_nonce():
-    """Generate a nonce for Interest packets"""
-    return int(time.time() * 1000) % 100000
-
 def calculate_checksum(data: str) -> str:
     """
     Standardized checksum calculation using SHA-256
-    Fixes the checksum mismatch warnings
     """
     if isinstance(data, bytes):
         data = data.decode('utf-8', errors='ignore')
@@ -228,34 +300,66 @@ def validate_content_name(name: str) -> bool:
     return bool(re.match(valid_pattern, name))
 
 def parse_fragment_notation(name: str) -> Optional[dict]:
-    """Parse fragment notation from content name"""
-    # Pattern: /path/to/file:[index/total]
+    """Parse fragment notation from content name.
+
+    Returns a dict containing both legacy keys (`index`, `total`) used across the
+    codebase and the newer, clearer keys (`fragment_index`, `total_fragments`) so
+    callers can migrate safely.
+    """
     import re
     pattern = r'^(.+):\[(\d+)/(\d+)\]$'
     match = re.match(pattern, name)
-    
+
     if match:
         base_name = match.group(1)
         index = int(match.group(2))
         total = int(match.group(3))
-        
+
         return {
             "base_name": base_name,
             "index": index,
             "total": total,
-            "is_fragment": True
+            "is_fragment": True,
+            "fragment_index": index,
+            "total_fragments": total
         }
-    
-    return None
+
+    # Not a fragment
+    return {
+        "base_name": name,
+        "is_fragment": False,
+        "fragment_index": 0,
+        "total_fragments": 1,
+        "index": 0,
+        "total": 1
+    }
+
+
+def create_fragment_name(base_name: str, index: int, total: int) -> str:
+    """Create fragment notation: /path/file.pdf:[1/4]"""
+    return f"{base_name}:[{index}/{total}]"
 
 # Compatibility functions for existing code
-def create_interest_packet(name: str, user_id: str, operation: str = "READ") -> InterestPacket:
-    """Create Interest packet with proper checksum"""
+def create_interest_packet(name: str, user_id: str, operation: str = "READ", reply_host: str = None, reply_port: int = None, reply_tcp_host: str = None, reply_tcp_port: int = None, target: str = None) -> InterestPacket:
+    """Create Interest packet with proper checksum (NO NONCE).
+
+    Optional: provide `reply_host` and `reply_port` to request that the
+    storage node push fragments directly to that address (persistent UDP socket).
+    Optionally provide `reply_tcp_host` and `reply_tcp_port` to advertise a TCP listener for a
+    reliable large-file transfer (TCP fallback).
+
+    `target` can be used to carry the original resource (e.g., when issuing an auth Interest
+    with name `/dlsu/server/auth` and `target` set to "/dlsu/storage/file.txt").
+    """
     return InterestPacket(
         name=name,
         user_id=user_id,
         operation=operation,
-        nonce=generate_nonce()
+        reply_host=reply_host,
+        reply_port=reply_port,
+        reply_tcp_host=reply_tcp_host,
+        reply_tcp_port=reply_tcp_port,
+        target=target
     )
 
 def create_data_packet(name: str, content: str) -> DataPacket:
@@ -268,9 +372,43 @@ def create_data_packet(name: str, content: str) -> DataPacket:
         data_length=len(content_bytes)
     )
 
+class PacketLogger:
+    """Simple packet logger that writes to console and per-node files"""
+    def __init__(self, node_name: str, log_dir: str = "logs"):
+        import os
+        from datetime import datetime
+        self.node_name = node_name
+        self.log_dir = log_dir
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.log_file = f"{self.log_dir}/{self.node_name}_{datetime.now().strftime('%Y%m%d')}.log"
+
+    def log(self, direction: str, packet_type: str, packet: dict, remote_addr: tuple):
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        if packet_type == "INTEREST":
+            details = f"name={packet.get('name')} user={packet.get('user_id')} op={packet.get('operation')}"
+        elif packet_type == "DATA":
+            details = f"name={packet.get('name')} status={packet.get('status','OK')}"
+        else:
+            details = str(packet)
+        addr_label = "from" if direction == "RECV" else "to"
+        entry = f"[{timestamp}] [{self.node_name}] [{direction}] [{packet_type}] {details} {addr_label}={remote_addr[0]}:{remote_addr[1]}"
+        try:
+            print(entry)
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(entry + '\n')
+        except Exception:
+            # avoid raising from logger
+            pass
+
+    def export(self, output_path: str):
+        import shutil, os
+        if os.path.exists(self.log_file):
+            shutil.copy(self.log_file, output_path)
+
 # Test checksum consistency
 if __name__ == "__main__":
-    print("Testing checksum consistency...")
+    print("Testing checksum consistency (NO NONCE)...")
     
     # Test Interest packet
     interest = create_interest_packet("/test/file", "alice", "READ")

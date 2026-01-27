@@ -206,13 +206,47 @@ class DebugGUI:
         """Thread-safe control message logging"""
         self.control_queue.put((message, tag))
     
+    def _sanitize(self, text: str) -> str:
+        """Replace non-ASCII or decorative characters with plain ASCII equivalents"""
+        replacements = {
+            "✓": "[OK]",
+            "✗": "[FAIL]",
+            "→": "->",
+            "←": "<-",
+            "📦": "[PKT]",
+            "⚠️": "[WARN]",
+            "❌": "[ERROR]",
+            "✉️": "[MSG]",
+            "═": "=",
+            "─": "-",
+            "│": "|",
+            "┌": "+",
+            "┐": "+",
+            "└": "+",
+            "┘": "+",
+            "├": "+",
+            "┤": "+",
+            "┬": "+",
+            "┴": "+",
+            "┼": "+",
+            "📋": "[CTRL]",
+            "🔍": "[DBG]"
+        }
+        out = text
+        for k, v in replacements.items():
+            out = out.replace(k, v)
+        # Remove any remaining non-ascii characters
+        out = ''.join(ch for ch in out if ord(ch) < 128)
+        return out
+
     def log_debug(self, message, msg_type="normal"):
         """Thread-safe debug message logging"""
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        self.debug_queue.put((timestamp, message, msg_type))
+        sanitized = self._sanitize(message)
+        self.debug_queue.put((timestamp, sanitized, msg_type))
         
-        # Store in export log
-        self.export_log.append(f"[{timestamp}] [{msg_type.upper()}] {message}")
+        # Store in export log (sanitized)
+        self.export_log.append(f"[{timestamp}] [{msg_type.upper()}] {sanitized}")
     
     def _process_queues(self):
         """Process message queues and update GUI"""

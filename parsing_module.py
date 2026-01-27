@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Parsing Module - Named Networks Framework
-Fixed checksum validation and error handling
+FIXED: Nonce validation removed
 """
 
 import json
@@ -12,7 +12,7 @@ from common import InterestPacket, DataPacket, PacketType, calculate_checksum
 class ParsingModule:
     """
     Parsing Module for Named Networks Framework
-    Fixed checksum validation to eliminate warnings
+    Fixed: No nonce validation
     """
     
     def __init__(self, node_name: str):
@@ -28,7 +28,7 @@ class ParsingModule:
             "validation_errors": 0
         }
         
-        print(f"[{self.node_name}][PARSING] Parsing Module initialized")
+        print(f"[{self.node_name}][PARSING] Parsing Module initialized (NO NONCE)")
     
     def set_processing_handler(self, handler: callable):
         """Set handler for processed packets"""
@@ -51,7 +51,9 @@ class ParsingModule:
             # Step 2: Parse based on type
             if packet_type == PacketType.INTEREST:
                 self.stats["interest_packets"] += 1
-                return self._handle_interest_packet(raw_packet, source)
+                response = self._handle_interest_packet(raw_packet, source)
+                print(f"[{self.node_name}][PARSING] _handle_interest_packet returned: {repr(response)[:200]}")
+                return response
             elif packet_type == PacketType.DATA:
                 self.stats["data_packets"] += 1
                 return self._handle_data_packet(raw_packet, source)
@@ -82,6 +84,7 @@ class ParsingModule:
     
     def _handle_interest_packet(self, raw_packet: str, source: str) -> Optional[str]:
         """Handle Interest packet parsing and validation"""
+        print(f"[{self.node_name}][PARSING] _handle_interest_packet invoked (from {source})")
         try:
             # Parse Interest packet
             interest_packet = InterestPacket.from_json(raw_packet)
@@ -96,8 +99,9 @@ class ParsingModule:
             if not interest_packet.validate_checksum():
                 self.stats["checksum_errors"] += 1
                 print(f"[{self.node_name}][PARSING] Note: Checksum recalculated for {interest_packet.name}")
-                # Recalculate checksum instead of failing
-                checksum_content = f"{interest_packet.name}|{interest_packet.user_id}|{interest_packet.operation}|{interest_packet.nonce}"
+                # Recalculate checksum instead of failing; include reply address if present
+                reply_part = f"|{interest_packet.reply_host}:{interest_packet.reply_port}" if getattr(interest_packet, 'reply_host', None) and getattr(interest_packet, 'reply_port', None) else ""
+                checksum_content = f"{interest_packet.name}|{interest_packet.user_id}|{interest_packet.operation}{reply_part}"
                 interest_packet.checksum = calculate_checksum(checksum_content)
             
             # Fragment support check
@@ -110,7 +114,18 @@ class ParsingModule:
             
             # Forward to Processing Module if handler is set
             if self.processing_handler:
-                return self.processing_handler(interest_packet, source, "interest")
+                try:
+                    response = self.processing_handler(interest_packet, source, "interest")
+                    # If handler returns None it means no immediate response should be sent (e.g., duplicate PIT),
+                    # so propagate None to the Communication Module which will not send a response.
+                    if response is None:
+                        print(f"[{self.node_name}][PARSING] Notice: processing handler returned None for Interest {interest_packet.name}; no immediate response sent")
+                        return None
+                    # Otherwise return the response (expected to be a Data packet JSON string)
+                    return response
+                except Exception as e:
+                    print(f"[{self.node_name}][PARSING] Error in processing handler: {e}")
+                    return self._create_error_response(f"Processing handler error: {e}")
             else:
                 # Simple response for testing without Processing Module
                 return self._create_simple_data_response(interest_packet.name, "Hello from router!")
@@ -146,7 +161,7 @@ class ParsingModule:
             return self._create_error_response(f"Data parsing error: {str(e)}")
     
     def _validate_interest_packet(self, interest: InterestPacket) -> Dict[str, Any]:
-        """Validate Interest packet structure and content"""
+        """Validate Interest packet structure and content (NO NONCE CHECK)"""
         
         # Check required fields
         if not interest.name:
@@ -160,13 +175,11 @@ class ParsingModule:
             return {"valid": False, "error": "Invalid content name format"}
         
         # Validate operation
-        valid_operations = ["READ", "WRITE", "PERMISSION"]
+        valid_operations = ["READ", "WRITE", "PERMISSION", "DELETE", "LIST", "GRANT", "REVOKE", "STATS", "CLEAR", "INFO", "EXECUTE"]
         if interest.operation.upper() not in valid_operations:
             return {"valid": False, "error": f"Invalid operation: {interest.operation}"}
         
-        # Validate nonce
-        if interest.nonce <= 0:
-            return {"valid": False, "error": "Invalid nonce"}
+        # NO NONCE VALIDATION - REMOVED
         
         return {"valid": True}
     
@@ -242,7 +255,7 @@ class ParsingModule:
 
 # Test the parsing module
 if __name__ == "__main__":
-    print("Testing Parsing Module with fixed checksums...")
+    print("Testing Parsing Module (NO NONCE)...")
     
     # Create test parser
     parser = ParsingModule("TestParser")

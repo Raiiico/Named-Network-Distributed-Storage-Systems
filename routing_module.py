@@ -27,8 +27,11 @@ class RoutingModule:
         self.node_name = node_name
         
         # Forwarding Information Base (FIB) - static routing table
-        self.fib: Dict[str, RoutingEntry] = {}
+        # Each prefix may have multiple RoutingEntry objects (for load balancing)
+        self.fib: Dict[str, List[RoutingEntry]] = {}
         self._fib_lock = threading.Lock()
+        # Round-robin counters per prefix
+        self._rr_counters: Dict[str, int] = {}
         
         # Default routes for different content types
         self._initialize_default_routes()
@@ -44,40 +47,33 @@ class RoutingModule:
         print(f"[{self.node_name}][ROUTING] Routing Module initialized")
     
     def _initialize_default_routes(self):
-        """Initialize default static routes"""
-        # Default routes for common content prefixes
-        default_routes = [
-            # Storage node routes
-            ("/dlsu/storage/node1", "127.0.0.1:9001", "eth0"),
-            ("/dlsu/storage/node2", "127.0.0.1:9002", "eth0"),
-            ("/dlsu/storage/node3", "127.0.0.1:9003", "eth0"),
-            ("/dlsu/storage/node4", "127.0.0.1:9004", "eth0"),
-            
-            # General storage route
-            ("/dlsu/storage", "127.0.0.1:9001", "eth0"),
-            
-            # Public content routes
-            ("/dlsu/public", "127.0.0.1:9001", "eth0"),
-            ("/dlsu/hello", "127.0.0.1:9001", "eth0"),
-            
-            # User directories
-            ("/dlsu/alice", "127.0.0.1:9002", "eth0"),
-            ("/dlsu/bob", "127.0.0.1:9003", "eth0"),
-            
-            # Shared content
-            ("/dlsu/shared", "127.0.0.1:9004", "eth0"),
-        ]
+        """Initialize default static routes - REMOVED"""
+        # Don't initialize anything here
+        print(f"[{self.node_name}][ROUTING] FIB empty - waiting for configuration")
+
+    def load_fib_from_config(self, routes_config):
+        """
+        Load FIB from external configuration
+        routes_config: list of tuples (prefix, next_hop, interface, hop_count)
+        """
+        print(f"[{self.node_name}][ROUTING] Loading FIB configuration...")
         
-        for prefix, next_hop, interface in default_routes:
-            self.add_route(prefix, next_hop, interface)
+        for route in routes_config:
+            prefix, next_hop, interface, hop_count = route
+            self.add_route(prefix, next_hop, interface, hop_count)
         
-        print(f"[{self.node_name}][ROUTING] Initialized {len(default_routes)} default routes")
+        print(f"[{self.node_name}][ROUTING] Loaded {len(routes_config)} routes")
     
     def add_route(self, prefix: str, next_hop: str, interface: str, hop_count: int = 1):
-        """Add a route to the FIB"""
+        """Add a route to the FIB. Multiple routes per prefix are allowed for load-balancing."""
         with self._fib_lock:
             entry = RoutingEntry(prefix, next_hop, interface, hop_count)
-            self.fib[prefix] = entry
+            if prefix not in self.fib:
+                self.fib[prefix] = []
+            self.fib[prefix].append(entry)
+            # Initialize round-robin counter if needed
+            if prefix not in self._rr_counters:
+                self._rr_counters[prefix] = 0
             print(f"[{self.node_name}][ROUTING] Added route: {prefix} -> {next_hop}")
     
     def remove_route(self, prefix: str):
@@ -95,22 +91,32 @@ class RoutingModule:
         self.stats["total_lookups"] += 1
         
         with self._fib_lock:
-            best_match = None
+            best_match_prefix = None
+            best_match_entry = None
             longest_prefix_length = 0
-            
+
             # Find longest matching prefix
-            for prefix, entry in self.fib.items():
+            for prefix, entries in self.fib.items():
                 if content_name.startswith(prefix):
                     prefix_length = len(prefix)
                     if prefix_length > longest_prefix_length:
                         longest_prefix_length = prefix_length
-                        best_match = entry
+                        best_match_prefix = prefix
                         self.stats["longest_prefix_matches"] += 1
-            
-            if best_match:
+
+            if best_match_prefix:
+                entries = self.fib.get(best_match_prefix, [])
+                if not entries:
+                    return None
+                # Round-robin selection
+                idx = self._rr_counters.get(best_match_prefix, 0) % len(entries)
+                selected = entries[idx]
+                # advance counter
+                self._rr_counters[best_match_prefix] = (self._rr_counters.get(best_match_prefix, 0) + 1) % max(1, len(entries))
+
                 self.stats["successful_matches"] += 1
-                print(f"[{self.node_name}][ROUTING] Route found for {content_name}: {best_match.next_hop}")
-                return best_match
+                print(f"[{self.node_name}][ROUTING] Route found for {content_name}: {selected.next_hop} (via {best_match_prefix})")
+                return selected
             else:
                 # Try default route
                 default_entry = self._get_default_route()
@@ -121,13 +127,24 @@ class RoutingModule:
                 
                 print(f"[{self.node_name}][ROUTING] No route found for {content_name}")
                 return None
+    def clear_fib(self):
+        """Clear all FIB entries"""
+        with self._fib_lock:
+            self.fib.clear()
+            self._rr_counters.clear()
+        print(f"[{self.node_name}][ROUTING] FIB cleared")
     
     def _get_default_route(self) -> Optional[RoutingEntry]:
-        """Get default route (first storage node)"""
+        """Get default route (first matching storage route)"""
         default_routes = ["/dlsu/storage/node1", "/dlsu/storage"]
         for route in default_routes:
-            if route in self.fib:
-                return self.fib[route]
+            if route in self.fib and self.fib[route]:
+                # Return round-robin selected entry for the default route
+                entries = self.fib[route]
+                idx = self._rr_counters.get(route, 0) % len(entries)
+                selected = entries[idx]
+                self._rr_counters[route] = (self._rr_counters.get(route, 0) + 1) % max(1, len(entries))
+                return selected
         return None
     
     def get_next_hop(self, content_name: str) -> Optional[str]:
@@ -155,14 +172,18 @@ class RoutingModule:
                 print("No routes configured")
                 return
             
-            print(f"{'Prefix':<30} {'Next Hop':<20} {'Interface':<10} {'Hops':<5}")
-            print("-" * 70)
-            
+            print(f"{ 'Prefix':<30} {'Next Hop(s)':<40} {'Interface':<10} {'Hops':<5}")
+            print("-" * 90)
+
             # Sort by prefix length (longest first) for display
             sorted_routes = sorted(self.fib.items(), key=lambda x: len(x[0]), reverse=True)
-            
-            for prefix, entry in sorted_routes:
-                print(f"{prefix:<30} {entry.next_hop:<20} {entry.interface:<10} {entry.hop_count:<5}")
+
+            for prefix, entries in sorted_routes:
+                next_hops = ', '.join(e.next_hop for e in entries)
+                interfaces = ','.join(e.interface for e in entries)
+                hops = ','.join(str(e.hop_count) for e in entries)
+                print(f"{prefix:<30} {next_hops:<40} {interfaces:<10} {hops:<5}")
+        
         
         print("=" * 70)
     

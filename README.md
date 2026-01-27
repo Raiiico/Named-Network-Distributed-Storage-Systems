@@ -355,6 +355,29 @@ Before presenting to adviser:
 
 ---
 
+## Unused / Archival (Suggested) 📁
+
+**Files / folders identified as candidates for archival or removal:**
+- `improved_client_gui.py` — alternate/improved client GUI; **no references found** in the repository. Archive if not needed for demos.
+- `improved_debug_gui.py` — alternate debug GUI; **no references found**. Archive if unused.
+- `__MACOSX/` and files named `._*` — macOS metadata and duplicate artifacts; **safe to delete**.
+
+**Recommended actions:**
+1. Move alternates to an `archive/` folder (keeps history and prevents accidental deletion):
+   ```bash
+   mkdir -p archive
+   git mv improved_client_gui.py improved_debug_gui.py archive/ || mv improved_client_gui.py improved_debug_gui.py archive/
+   ```
+2. Remove macOS artifacts:
+   ```bash
+   git rm -r __MACOSX/ || rm -r __MACOSX/
+   ```
+3. Commit with a clear message (e.g., "archive: move unused GUIs; remove macOS artifacts") so changes are reversible.
+
+**Note:** Demo/test scripts (e.g., `test_*.py`, `security_module_tester.py`, `router_raid_demonstration.py`, `router_raid_aware.py`) are intentionally **kept** for demonstration and testing and should not be removed unless you decide to archive them as well.
+
+If you'd like, I can move the files into `archive/` and add a short note in the README describing the change (safe git-friendly change).
+
 ## Contact
 
 For questions about implementation details or testing procedures, refer to the individual module documentation within each Python file.
