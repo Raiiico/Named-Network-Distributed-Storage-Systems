@@ -398,6 +398,16 @@ class SecurityModule:
                     name = f['name']
                     owner = f['owner']
                     acl = ResourceACL(resource_name=name, owner=owner, created_at=time.time(), acl_entries={}, is_public=False)
+                    
+                    # IMPORTANT: Add owner as ADMIN so they can grant permissions after restart
+                    owner_ace = AccessControlEntry(
+                        user_id=owner,
+                        permissions=PermissionLevel.ADMIN.value,
+                        granted_by="system",
+                        granted_at=time.time()
+                    )
+                    acl.acl_entries[owner] = owner_ace
+                    
                     self.resource_acls[name] = acl
                 # Attach permissions
                 perms = self.db.list_permissions()
@@ -667,6 +677,78 @@ class SecurityModule:
             return SecurityResponse(
                 success=True,
                 message="Permissions revoked"
+            )
+
+    def revoke_write_permission(self, resource_name: str, user_id: str, 
+                                revoked_by: str) -> SecurityResponse:
+        """Revoke only WRITE permission for a user, keeping READ access.
+        This downgrades from READ+WRITE to READ only.
+        """
+        # If DB present, perform downgrade in DB
+        if self.db is not None:
+            try:
+                # Verify revoker has OWNER permissions
+                check = self.db.check_permission(revoked_by, resource_name, 'OWNER')
+                if not check.get('authorized'):
+                    return SecurityResponse(success=False, message='Insufficient permissions to revoke access')
+
+                # Prevent modifying owner's permissions
+                file = self.db.get_file_by_name(resource_name)
+                if file and file.get('owner') == user_id:
+                    return SecurityResponse(success=False, message="Cannot revoke owner's permissions")
+
+                # Downgrade permission from WRITE to READ
+                res = self.db.downgrade_permission(resource_name, user_id, 'READ')
+                # Sync cache
+                if hasattr(self, 'sync_acls_from_db'):
+                    self.sync_acls_from_db()
+                if res.get('affected', 0) > 0:
+                    return SecurityResponse(success=True, message=f"Downgraded {user_id} to READ-only on {resource_name}")
+                else:
+                    return SecurityResponse(success=False, message=f"No permission found for {user_id} on {resource_name}")
+            except Exception as e:
+                return SecurityResponse(success=False, message=str(e))
+
+        # Fallback to in-memory ACL
+        with self.acl_lock:
+            acl = self.resource_acls.get(resource_name)
+            
+            if not acl:
+                return SecurityResponse(
+                    success=False,
+                    message="Resource not found"
+                )
+            
+            # Verify revoker has admin permissions
+            if not self._has_permission(acl, revoked_by, PermissionLevel.ADMIN.value):
+                return SecurityResponse(
+                    success=False,
+                    message="Insufficient permissions to revoke access"
+                )
+            
+            # Cannot modify owner's permissions
+            if user_id == acl.owner:
+                return SecurityResponse(
+                    success=False,
+                    message="Cannot revoke owner's permissions"
+                )
+            
+            # Downgrade ACE from WRITE to READ
+            if user_id in acl.acl_entries:
+                ace = acl.acl_entries[user_id]
+                # Remove WRITE bit, keep READ
+                new_perms = ace.permissions & ~PermissionLevel.WRITE.value
+                new_perms = new_perms | PermissionLevel.READ.value  # Ensure READ is present
+                ace.permissions = new_perms
+                print(f"[{self.node_name}][SECURITY] Downgraded {user_id} to READ-only on {resource_name}")
+                return SecurityResponse(
+                    success=True,
+                    message="WRITE permission revoked, READ access retained"
+                )
+            
+            return SecurityResponse(
+                success=False,
+                message=f"No permission found for {user_id}"
             )
 
     def delete_file(self, resource_name: str, deleted_by: str) -> SecurityResponse:

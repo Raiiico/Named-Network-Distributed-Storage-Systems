@@ -130,12 +130,24 @@ class Database:
             granted_at INTEGER NOT NULL
         );
 
+        -- RAID groups: logical grouping of storage nodes for redundancy
+        CREATE TABLE IF NOT EXISTS raid_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_name TEXT UNIQUE NOT NULL,
+            raid_level TEXT NOT NULL CHECK(raid_level IN ('raid0', 'raid1', 'raid5', 'raid6')),
+            min_nodes INTEGER NOT NULL DEFAULT 2,
+            active INTEGER DEFAULT 1,
+            round_robin_counter INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS storage_nodes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             node_name TEXT UNIQUE,
             host TEXT,
             port INTEGER,
             raid_mode TEXT,
+            raid_group_id INTEGER REFERENCES raid_groups(id),
             active INTEGER DEFAULT 1
         );
 
@@ -160,6 +172,39 @@ class Database:
 
         COMMIT;
         """)
+        self._conn.commit()
+        
+        # Run migrations for existing databases
+        self._run_migrations()
+
+    def _run_migrations(self):
+        """Add missing columns to existing tables (for databases created before schema updates)"""
+        cur = self._conn.cursor()
+        
+        # Check if raid_groups table exists, create if not
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='raid_groups'")
+        if not cur.fetchone():
+            cur.execute("""
+                CREATE TABLE raid_groups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_name TEXT UNIQUE NOT NULL,
+                    raid_level TEXT NOT NULL CHECK(raid_level IN ('raid0', 'raid1', 'raid5', 'raid6')),
+                    min_nodes INTEGER NOT NULL DEFAULT 2,
+                    active INTEGER DEFAULT 1,
+                    round_robin_counter INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                )
+            """)
+            print("[DB] Migration: Created raid_groups table")
+        
+        # Check if raid_group_id column exists in storage_nodes
+        cur.execute("PRAGMA table_info(storage_nodes)")
+        columns = [row[1] for row in cur.fetchall()]
+        
+        if 'raid_group_id' not in columns:
+            cur.execute("ALTER TABLE storage_nodes ADD COLUMN raid_group_id INTEGER REFERENCES raid_groups(id)")
+            print("[DB] Migration: Added raid_group_id column to storage_nodes")
+        
         self._conn.commit()
 
     # User helpers
@@ -348,26 +393,108 @@ class Database:
         )
         return [dict(r) for r in cur.fetchall()]
 
+    # ==================== ENCRYPTION KEY MANAGEMENT ====================
+    
+    def store_encryption_key(self, file_name: str, encryption_key: str) -> bool:
+        """Store or update encryption key for a file in its metadata.
+        
+        Args:
+            file_name: The logical file name
+            encryption_key: Hex-encoded XOR encryption key
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        def _do_store(conn):
+            file = self.get_file_by_name(file_name)
+            if not file:
+                raise ValueError(f"File not found: {file_name}")
+            
+            # Parse existing metadata or create new
+            existing_meta = {}
+            if file.get('metadata'):
+                try:
+                    existing_meta = json.loads(file['metadata'])
+                except Exception:
+                    existing_meta = {}
+            
+            # Add encryption key
+            existing_meta['encryption_key'] = encryption_key
+            existing_meta['is_encrypted'] = True
+            
+            # Update in DB
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE files SET metadata = ? WHERE name = ?",
+                (json.dumps(existing_meta), file_name)
+            )
+            conn.commit()
+            print(f"[DB] Stored encryption key for {file_name}")
+            return True
+        
+        try:
+            return self._execute_with_retry(_do_store)
+        except Exception as e:
+            print(f"[DB] Error storing encryption key: {e}")
+            return False
+    
+    def get_encryption_key(self, file_name: str) -> Optional[str]:
+        """Retrieve encryption key for a file from its metadata.
+        
+        Args:
+            file_name: The logical file name
+            
+        Returns:
+            Hex-encoded encryption key or None if not found/not encrypted
+        """
+        self._init_connection()
+        file = self.get_file_by_name(file_name)
+        if not file:
+            return None
+        
+        if not file.get('metadata'):
+            return None
+        
+        try:
+            meta = json.loads(file['metadata'])
+            return meta.get('encryption_key')
+        except Exception:
+            return None
+
     # Storage node helpers
-    def register_storage_node(self, node_name: str, host: Optional[str] = None, port: Optional[int] = None, raid_mode: Optional[str] = None) -> Dict[str, Any]:
+    def register_storage_node(self, node_name: str, host: Optional[str] = None, port: Optional[int] = None, raid_mode: Optional[str] = None, raid_group_name: Optional[str] = None) -> Dict[str, Any]:
         """Register or update a storage node record and return it"""
         self._init_connection()
         cur = self._conn.cursor()
+        
+        # Resolve raid_group_id if group name provided
+        raid_group_id = None
+        if raid_group_name:
+            group = self.get_raid_group(raid_group_name)
+            if group:
+                raid_group_id = group['id']
+        
         # Check if node exists
         cur.execute("SELECT id FROM storage_nodes WHERE node_name = ?", (node_name,))
         existing = cur.fetchone()
         if existing:
             # Update existing node with new host/port if provided
             if host is not None and port is not None:
-                cur.execute(
-                    "UPDATE storage_nodes SET host = ?, port = ?, raid_mode = COALESCE(?, raid_mode), active = 1 WHERE node_name = ?",
-                    (host, port, raid_mode, node_name)
-                )
+                if raid_group_id is not None:
+                    cur.execute(
+                        "UPDATE storage_nodes SET host = ?, port = ?, raid_mode = COALESCE(?, raid_mode), raid_group_id = ?, active = 1 WHERE node_name = ?",
+                        (host, port, raid_mode, raid_group_id, node_name)
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE storage_nodes SET host = ?, port = ?, raid_mode = COALESCE(?, raid_mode), active = 1 WHERE node_name = ?",
+                        (host, port, raid_mode, node_name)
+                    )
         else:
             # Insert new node
             cur.execute(
-                "INSERT INTO storage_nodes (node_name, host, port, raid_mode, active) VALUES (?, ?, ?, ?, 1)",
-                (node_name, host, port, raid_mode)
+                "INSERT INTO storage_nodes (node_name, host, port, raid_mode, raid_group_id, active) VALUES (?, ?, ?, ?, ?, 1)",
+                (node_name, host, port, raid_mode, raid_group_id)
             )
         self._conn.commit()
         cur.execute("SELECT * FROM storage_nodes WHERE node_name = ?", (node_name,))
@@ -385,8 +512,144 @@ class Database:
         """Return all registered storage nodes"""
         self._init_connection()
         cur = self._conn.cursor()
-        cur.execute("SELECT node_name, host, port, raid_mode, active FROM storage_nodes")
+        cur.execute("SELECT node_name, host, port, raid_mode, raid_group_id, active FROM storage_nodes")
         return [dict(r) for r in cur.fetchall()]
+
+    # RAID Group helpers
+    def create_raid_group(self, group_name: str, raid_level: str, min_nodes: int = 2) -> Dict[str, Any]:
+        """Create a RAID group for grouping storage nodes"""
+        self._init_connection()
+        cur = self._conn.cursor()
+        now = int(time.time())
+        cur.execute("SELECT id FROM raid_groups WHERE group_name = ?", (group_name,))
+        existing = cur.fetchone()
+        if existing:
+            # Update existing
+            cur.execute(
+                "UPDATE raid_groups SET raid_level = ?, min_nodes = ?, active = 1 WHERE group_name = ?",
+                (raid_level, min_nodes, group_name)
+            )
+        else:
+            cur.execute(
+                "INSERT INTO raid_groups (group_name, raid_level, min_nodes, round_robin_counter, created_at) VALUES (?, ?, ?, 0, ?)",
+                (group_name, raid_level, min_nodes, now)
+            )
+        self._conn.commit()
+        cur.execute("SELECT * FROM raid_groups WHERE group_name = ?", (group_name,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_raid_group(self, group_name: str) -> Optional[Dict[str, Any]]:
+        """Get RAID group by name"""
+        self._init_connection()
+        cur = self._conn.cursor()
+        cur.execute("SELECT * FROM raid_groups WHERE group_name = ?", (group_name,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_raid_groups(self) -> List[Dict[str, Any]]:
+        """List all RAID groups with their nodes"""
+        self._init_connection()
+        cur = self._conn.cursor()
+        cur.execute("SELECT * FROM raid_groups WHERE active = 1")
+        groups = [dict(r) for r in cur.fetchall()]
+        # Attach nodes to each group
+        for group in groups:
+            cur.execute(
+                "SELECT node_name, host, port, active FROM storage_nodes WHERE raid_group_id = ?",
+                (group['id'],)
+            )
+            group['nodes'] = [dict(r) for r in cur.fetchall()]
+        return groups
+
+    def get_raid_groups_by_level(self, raid_level: str) -> List[Dict[str, Any]]:
+        """Get all RAID groups with a specific RAID level (raid0, raid1, raid5, raid6)"""
+        self._init_connection()
+        cur = self._conn.cursor()
+        cur.execute("SELECT * FROM raid_groups WHERE raid_level = ? AND active = 1", (raid_level,))
+        groups = [dict(r) for r in cur.fetchall()]
+        for group in groups:
+            cur.execute(
+                "SELECT node_name, host, port, active FROM storage_nodes WHERE raid_group_id = ? AND active = 1",
+                (group['id'],)
+            )
+            group['nodes'] = [dict(r) for r in cur.fetchall()]
+        return groups
+
+    def assign_node_to_raid_group(self, node_name: str, group_name: str) -> Dict[str, Any]:
+        """Assign a storage node to a RAID group"""
+        self._init_connection()
+        group = self.get_raid_group(group_name)
+        if not group:
+            raise ValueError(f"RAID group '{group_name}' not found")
+        cur = self._conn.cursor()
+        cur.execute(
+            "UPDATE storage_nodes SET raid_group_id = ? WHERE node_name = ?",
+            (group['id'], node_name)
+        )
+        self._conn.commit()
+        return {'success': True, 'node': node_name, 'group': group_name}
+
+    def get_raid_round_robin_counter(self, raid_level: str) -> int:
+        """Get the round-robin counter for a RAID level (picks which group to use next)"""
+        self._init_connection()
+        cur = self._conn.cursor()
+        # We use the first active group of this level to track the counter
+        cur.execute(
+            "SELECT round_robin_counter FROM raid_groups WHERE raid_level = ? AND active = 1 ORDER BY id LIMIT 1",
+            (raid_level,)
+        )
+        row = cur.fetchone()
+        return row['round_robin_counter'] if row else 0
+
+    def increment_raid_round_robin(self, raid_level: str) -> int:
+        """Increment round-robin counter for a RAID level, return new value"""
+        self._init_connection()
+        cur = self._conn.cursor()
+        # Get current counter
+        cur.execute(
+            "SELECT id, round_robin_counter FROM raid_groups WHERE raid_level = ? AND active = 1 ORDER BY id LIMIT 1",
+            (raid_level,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return 0
+        new_counter = row['round_robin_counter'] + 1
+        cur.execute(
+            "UPDATE raid_groups SET round_robin_counter = ? WHERE id = ?",
+            (new_counter, row['id'])
+        )
+        self._conn.commit()
+        return new_counter
+
+    def get_nodes_in_raid_group(self, group_name: str) -> List[Dict[str, Any]]:
+        """Get all active storage nodes in a RAID group"""
+        self._init_connection()
+        group = self.get_raid_group(group_name)
+        if not group:
+            return []
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT node_name, host, port, active FROM storage_nodes WHERE raid_group_id = ? AND active = 1",
+            (group['id'],)
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def mark_node_inactive(self, node_name: str) -> bool:
+        """Mark a storage node as inactive (for failover)"""
+        self._init_connection()
+        cur = self._conn.cursor()
+        cur.execute("UPDATE storage_nodes SET active = 0 WHERE node_name = ?", (node_name,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def mark_node_active(self, node_name: str) -> bool:
+        """Mark a storage node as active"""
+        self._init_connection()
+        cur = self._conn.cursor()
+        cur.execute("UPDATE storage_nodes SET active = 1 WHERE node_name = ?", (node_name,))
+        self._conn.commit()
+        return cur.rowcount > 0
 
     def add_file_location(self, file_name: str, node_name: str, stored_path: Optional[str] = None, host: Optional[str] = None, port: Optional[int] = None) -> Dict[str, Any]:
         """Record that a storage node holds a file. If the file does not exist, create with owner 'system'."""
@@ -456,6 +719,29 @@ class Database:
             conn.commit()
             return {'success': True, 'affected': affected}
         return self._execute_with_retry(_do_revoke)
+
+    def downgrade_permission(self, file_name: str, grantee_username: str, new_permission: str) -> Dict[str, Any]:
+        """Downgrade a grantee's permission on a file (e.g., from WRITE to READ).
+        Returns dict with success and affected count.
+        """
+        def _do_downgrade(conn):
+            if new_permission not in ('READ', 'WRITE', 'OWNER'):
+                raise ValueError('Invalid permission')
+            file = self.get_file_by_name(file_name)
+            if not file:
+                raise ValueError('File not found')
+            grantee = self.get_user(grantee_username)
+            if not grantee:
+                raise ValueError('Grantee user not found')
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE permissions SET permission = ? WHERE file_id = ? AND grantee_user_id = ?",
+                (new_permission, file['id'], grantee['id'])
+            )
+            affected = cur.rowcount
+            conn.commit()
+            return {'success': True, 'affected': affected}
+        return self._execute_with_retry(_do_downgrade)
 
     def delete_file(self, file_name: str) -> Dict[str, Any]:
         """Delete a file and all its permissions/locations from the database.

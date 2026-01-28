@@ -13,6 +13,35 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 from enum import Enum
 
+
+def get_optimal_fragment_size(file_size_bytes: int) -> int:
+    """
+    Returns optimal fragment size based on file size to reduce fragment count.
+    
+    Adaptive sizing with UDP-safe limits:
+    - Small files (<1MB): 4KB fragments
+    - Medium files (1-10MB): 8KB fragments  
+    - Large files (>10MB): 8KB fragments
+    
+    IMPORTANT: UDP has practical size limits much smaller than the theoretical 64KB max.
+    Windows default UDP buffer is typically 8-16KB. We use 8KB max to ensure reliable
+    delivery across all platforms without requiring SO_SNDBUF/SO_RCVBUF socket changes.
+    
+    For a 10MB file: ~1,280 fragments (8KB) vs ~10,000 fragments (1KB) = 8x improvement.
+    """
+    ONE_MB = 1024 * 1024
+    TEN_MB = 10 * ONE_MB
+    
+    if file_size_bytes < ONE_MB:
+        return 4 * 1024      # 4KB for small files
+    else:
+        return MAX_UDP_FRAGMENT_SIZE  # 8KB for medium and large files
+
+
+# Maximum safe UDP fragment size to avoid WinError 10040 (datagram too large)
+MAX_UDP_FRAGMENT_SIZE = 8192  # 8KB - safe across all platforms
+
+
 class PacketType(Enum):
     INTEREST = "INTEREST"
     DATA = "DATA"
@@ -25,12 +54,15 @@ class InterestPacket:
     so a requester can indicate where to receive pushed fragments. Also includes
     an optional `reply_tcp_port` field that allows clients to advertise a TCP
     listener port for reliable large-file transfers (TCP fallback).
+    
+    For WRITE_DATA operations, `write_payload` carries the base64-encoded data.
     """
     packet_type: str = "INTEREST"
     name: str = ""                    # Hierarchical content name
     user_id: str = ""                 # User identifier
-    operation: str = "READ"           # READ, WRITE, PERMISSION
+    operation: str = "READ"           # READ, WRITE, WRITE_DATA, PERMISSION, DELETE
     auth_key: Optional[str] = None    # One-time authentication key
+    read_token: Optional[str] = None  # Multi-use token for fragment access (avoids re-auth)
     reply_host: Optional[str] = None  # Optional host where replies should be pushed (UDP)
     reply_port: Optional[int] = None  # Optional port where replies should be pushed (UDP)
     reply_tcp_host: Optional[str] = None # Optional TCP host for large transfers (preserve client host)
@@ -38,6 +70,10 @@ class InterestPacket:
     checksum: str = ""                # Packet integrity
     # Optional target resource for special Interests (e.g., auth checks)
     target: Optional[str] = None
+    # Write payload for WRITE_DATA operations (base64-encoded data)
+    write_payload: Optional[str] = None
+    # Target storage for WRITE_DATA operations (host:port assigned during WRITE auth)
+    target_storage: Optional[str] = None
     
     def to_json(self):
         """Serialize to JSON with standardized checksum"""
@@ -57,6 +93,7 @@ class InterestPacket:
             "user_id": self.user_id,
             "operation": self.operation,
             "auth_key": self.auth_key,
+            "read_token": self.read_token,
             "reply_host": self.reply_host,
             "reply_port": self.reply_port,
             "reply_tcp_host": self.reply_tcp_host,
@@ -65,6 +102,10 @@ class InterestPacket:
         }
         if self.target:
             obj["target"] = self.target
+        if self.write_payload:
+            obj["write_payload"] = self.write_payload
+        if self.target_storage:
+            obj["target_storage"] = self.target_storage
         return json.dumps(obj)
     
     @classmethod
@@ -79,12 +120,15 @@ class InterestPacket:
             user_id=data.get("user_id", ""),
             operation=data.get("operation", "READ"),
             auth_key=data.get("auth_key"),
+            read_token=data.get("read_token"),
             reply_host=data.get("reply_host"),
             reply_port=data.get("reply_port"),
             reply_tcp_host=data.get("reply_tcp_host"),
             reply_tcp_port=data.get("reply_tcp_port"),
             checksum=data.get("checksum", ""),
-            target=data.get("target")
+            target=data.get("target"),
+            write_payload=data.get("write_payload"),
+            target_storage=data.get("target_storage")
         )
 
         return packet
@@ -214,26 +258,75 @@ class DataPacket:
         return cls.from_json(b.decode('utf-8'))
 
 class ContentStore:
-    """Content Store - caches named data"""
-    def __init__(self):
+    """Content Store - caches named data with LRU eviction and max size limit.
+    
+    NDN-style cache: simple name → data mapping.
+    - Lookup is pure name matching (no timestamp/checksum validation)
+    - Eviction is LRU-based when max_size is reached
+    - Invalidation is explicit (on WRITE/DELETE operations)
+    """
+    def __init__(self, max_size: int = 2000):
+        # Default 2000 entries: supports ~16MB file with 8KB fragments (2000 * 8KB = 16MB)
         self.store: Dict[str, bytes] = {}
-        self.timestamps: Dict[str, float] = {}
+        self.access_order: List[str] = []  # LRU tracking - most recent at end
+        self.max_size = max_size
         self._lock = threading.Lock()
     
     def get(self, name: str) -> Optional[bytes]:
-        """Retrieve content by name"""
+        """Retrieve content by name and update access order (LRU).
+        
+        Simple name-based lookup following NDN principles:
+        - If name exists in store, return data
+        - No timestamp validation
+        - No checksum validation
+        - No staleness checks
+        """
         with self._lock:
-            return self.store.get(name)
+            if name in self.store:
+                # Update access order - move to end (most recently used)
+                if name in self.access_order:
+                    self.access_order.remove(name)
+                self.access_order.append(name)
+                return self.store[name]
+            return None
     
     def put(self, name: str, content: bytes):
-        """Store content with name"""
+        """Store content with name, evicting LRU if at max capacity.
+        
+        Simple storage: just name → bytes mapping.
+        """
         with self._lock:
             if isinstance(content, str):
                 content = content.encode('utf-8')
             
+            # If already cached, just update
+            if name in self.store:
+                self.store[name] = content
+                # Update access order
+                if name in self.access_order:
+                    self.access_order.remove(name)
+                self.access_order.append(name)
+                return
+            
+            # Evict LRU entries if at max capacity
+            while len(self.store) >= self.max_size and self.access_order:
+                lru_name = self.access_order.pop(0)  # Remove oldest (first)
+                if lru_name in self.store:
+                    del self.store[lru_name]
+            
             self.store[name] = content
-            self.timestamps[name] = time.time()
-            print(f"[CS] Cached content for: {name}")
+            self.access_order.append(name)
+    
+    def remove(self, name: str) -> bool:
+        """Remove a specific entry from cache (for invalidation)"""
+        with self._lock:
+            removed = False
+            if name in self.store:
+                del self.store[name]
+                removed = True
+            if name in self.access_order:
+                self.access_order.remove(name)
+            return removed
     
     def has(self, name: str) -> bool:
         """Check if content exists"""
@@ -244,6 +337,31 @@ class ContentStore:
         """Get number of cached items"""
         with self._lock:
             return len(self.store)
+    
+    def remove_by_prefix(self, prefix: str) -> int:
+        """Remove all entries whose names start with the given prefix.
+        
+        Used for cache invalidation when a file is written or deleted.
+        E.g., remove_by_prefix("/dlsu/storage/file.txt") removes:
+          - /dlsu/storage/file.txt
+          - /dlsu/storage/file.txt:[1/100]
+          - /dlsu/storage/file.txt:[2/100]
+          - etc.
+        
+        Returns the number of entries removed.
+        """
+        with self._lock:
+            keys_to_remove = [k for k in self.store.keys() if k.startswith(prefix)]
+            for key in keys_to_remove:
+                del self.store[key]
+                if key in self.access_order:
+                    self.access_order.remove(key)
+            return len(keys_to_remove)
+    
+    def list_cached(self) -> List[str]:
+        """List all cached names (for debugging)"""
+        with self._lock:
+            return list(self.store.keys())
 
 class PendingInterestTable:
     """Pending Interest Table - tracks forwarded interests"""

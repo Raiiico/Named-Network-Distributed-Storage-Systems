@@ -7,7 +7,7 @@ Compatible with the fixed communication_module.py and common.py
 import time
 import sys
 import os
-from common import create_interest_packet, DataPacket, calculate_checksum
+from common import create_interest_packet, DataPacket, calculate_checksum, get_optimal_fragment_size
 from communication_module import CommunicationModule
 
 class SimpleClient:
@@ -257,7 +257,7 @@ class SimpleClient:
                 if not command:
                     continue
                 
-                parts = command.split(maxsplit=1)
+                parts = command.split()  # Split into all parts (no maxsplit limit)
                 cmd = parts[0].lower()
                 
                 if cmd in ["quit", "exit"]:
@@ -279,6 +279,7 @@ class SimpleClient:
 
                     name = parts[1]
                     raid_preference = parts[2].lower() if len(parts) > 2 else None
+                    print(f"[DEBUG] Command parts: {parts}, name={name}, raid_preference={raid_preference}")
                     operation = cmd.lower()
                     if operation == 'permission':
                         # Simple permission check against auth server
@@ -302,36 +303,45 @@ class SimpleClient:
                         elif raid_preference:
                             print(f"📦 RAID preference: {raid_preference.upper()}")
                         
-                        # Defaults - server will assign actual storage via round-robin or RAID preference
-                        shost, sport = '127.0.0.1', 9001
-
-                        self._do_write(local_path, name, shost, sport, password=self.password, raid_preference=raid_preference)
+                        # All communication goes through router (FIB topology)
+                        self._do_write(local_path, name, password=self.password, raid_preference=raid_preference, router_host=router_host, router_port=router_port)
                 
                 elif cmd == "grant":
-                    if len(parts) < 2:
-                        print("  Usage: grant <file> <user>")
-                        print("  Example: grant /files/doc.txt bob")
+                    if len(parts) < 4:
+                        print("  Usage: grant <READ|WRITE> <file> <user>")
+                        print("  Example: grant READ /files/doc.txt bob   - grants READ only")
+                        print("  Example: grant WRITE /files/doc.txt bob  - grants READ+WRITE")
                         continue
-                    args = parts[1].split()
-                    if len(args) < 2:
-                        print("  Usage: grant <file> <user>")
+                    perm_level = parts[1].upper()
+                    if perm_level not in ('READ', 'WRITE'):
+                        print(f"  Invalid permission level: {parts[1]}")
+                        print("  Use READ (read only) or WRITE (read+write)")
                         continue
-                    file_name = args[0]
-                    target_user = args[1]
-                    self._grant_permission(file_name, target_user)
+                    file_name = parts[2]
+                    target_user = parts[3]
+                    self._grant_permission(file_name, target_user, perm_level)
                 
                 elif cmd == "revoke":
-                    if len(parts) < 2:
-                        print("  Usage: revoke <file> <user>")
+                    # revoke <file> <user> - revokes all permissions
+                    # revoke WRITE <file> <user> - revokes only WRITE, keeps READ
+                    if len(parts) < 3:
+                        print("  Usage: revoke <file> <user>           - revokes all permissions")
+                        print("         revoke WRITE <file> <user>     - revokes WRITE only, keeps READ")
                         print("  Example: revoke /files/doc.txt bob")
+                        print("  Example: revoke WRITE /files/doc.txt bob")
                         continue
-                    args = parts[1].split()
-                    if len(args) < 2:
-                        print("  Usage: revoke <file> <user>")
-                        continue
-                    file_name = args[0]
-                    target_user = args[1]
-                    self._revoke_permission(file_name, target_user)
+                    # Check if first arg is WRITE (partial revoke)
+                    if parts[1].upper() == 'WRITE':
+                        if len(parts) < 4:
+                            print("  Usage: revoke WRITE <file> <user>")
+                            continue
+                        file_name = parts[2]
+                        target_user = parts[3]
+                        self._revoke_permission(file_name, target_user, revoke_write_only=True)
+                    else:
+                        file_name = parts[1]
+                        target_user = parts[2]
+                        self._revoke_permission(file_name, target_user, revoke_write_only=False)
                 
                 elif cmd == "myfiles":
                     self._list_my_files()
@@ -350,8 +360,8 @@ class SimpleClient:
                     print("  write <name> [raid]  - Write content (optional: raid0, raid1, raid5, raid6)")
                     print("  delete <name>        - Delete a file you own")
                     print("  permission <name>    - Check permissions")
-                    print("  grant <file> <user>  - Grant access to user")
-                    print("  revoke <file> <user> - Revoke user access")
+                    print("  grant <READ|WRITE> <file> <user>  - Grant READ or READ+WRITE access")
+                    print("  revoke [WRITE] <file> <user>      - Revoke access (WRITE only or all)")
                     print("  myfiles              - List your files")
                     print("  nodestats            - Show RAID statistics for all storage nodes")
                     print("  concurrent           - Test concurrent requests")
@@ -381,11 +391,12 @@ class SimpleClient:
             except Exception as e:
                 print(f"Error: {e}")
     
-    def _grant_permission(self, file_name: str, target_user: str, router_host: str = '127.0.0.1', router_port: int = 8001):
-        """Grant READ permission to another user on your file via router (NDN Interest)
-        Name format used: /dlsu/server/permission/grant:<resource>:<target>
+    def _grant_permission(self, file_name: str, target_user: str, perm_level: str = 'READ', router_host: str = '127.0.0.1', router_port: int = 8001):
+        """Grant permission to another user on your file via router (NDN Interest)
+        perm_level: 'READ' for read-only, 'WRITE' for read+write
+        Name format: /dlsu/server/permission/grant:<perm>:<resource>:<target>
         Password is sent as auth_key in Interest"""
-        name = f"/dlsu/server/permission/grant:{file_name}:{target_user}"
+        name = f"/dlsu/server/permission/grant:{perm_level}:{file_name}:{target_user}"
         resp = self.send_interest(name, operation='PERMISSION', router_host=router_host, router_port=router_port, auth_key=self.password)
         if resp:
             try:
@@ -396,9 +407,13 @@ class SimpleClient:
         else:
             print("✗ No response from router/server")
 
-    def _revoke_permission(self, file_name: str, target_user: str, router_host: str = '127.0.0.1', router_port: int = 8001):
-        """Revoke permission via router using Interest name /dlsu/server/permission/revoke:<resource>:<target>"""
-        name = f"/dlsu/server/permission/revoke:{file_name}:{target_user}"
+    def _revoke_permission(self, file_name: str, target_user: str, revoke_write_only: bool = False, router_host: str = '127.0.0.1', router_port: int = 8001):
+        """Revoke permission via router
+        revoke_write_only: if True, only revokes WRITE (keeps READ); if False, revokes all
+        Name format: /dlsu/server/permission/revoke:<mode>:<resource>:<target>
+        """
+        mode = 'WRITE' if revoke_write_only else 'ALL'
+        name = f"/dlsu/server/permission/revoke:{mode}:{file_name}:{target_user}"
         resp = self.send_interest(name, operation='PERMISSION', router_host=router_host, router_port=router_port, auth_key=self.password)
         if resp:
             try:
@@ -495,7 +510,8 @@ class SimpleClient:
         total_size = 0
         
         for node_name, host, port, raid_level in storage_nodes:
-            print(f"\n📦 {node_name} (RAID {raid_level}) @ {host}:{port}")
+            raid_num = raid_level.replace('raid', '') if isinstance(raid_level, str) else raid_level
+            print(f"\n📦 {node_name} (RAID {raid_num}) @ {host}:{port}")
             print(f"   {'─'*60}")
             
             try:
@@ -523,7 +539,9 @@ class SimpleClient:
                         print(f"   Parity Blocks:    {stats.get('parity_count', 0)}")
                         print(f"   Total Size:       {stats.get('total_size_kb', 0):.2f} KB")
                         print(f"   Requests Handled: {stats.get('requests_handled', 0)}")
-                        print(f"   Mirror Target:    {'Yes' if stats.get('is_mirror_target') else 'No'}")
+                        peers = stats.get('raid_peers', [])
+                        print(f"   RAID Peers:       {', '.join(peers) if peers else 'None'}")
+                        print(f"   RAID Operations:  {stats.get('raid_operations', 0)}")
                         
                         total_files += stats.get('file_count', 0)
                         total_fragments += stats.get('fragment_count', 0)
@@ -585,12 +603,8 @@ class SimpleClient:
         # Step 2: Clear storage nodes
         print("\n📦 Step 2: Clearing storage nodes...")
         
-        storage_nodes = [
-            ('ST1', '127.0.0.1', 9001, 0),
-            ('ST2', '127.0.0.1', 9002, 1),
-            ('ST3', '127.0.0.1', 9003, 5),
-            ('ST4', '127.0.0.1', 9004, 6),
-        ]
+        # Get storage nodes from fib_config
+        storage_nodes = self._get_all_storage_nodes()
         
         for node_name, host, port, raid_level in storage_nodes:
             try:
@@ -692,7 +706,10 @@ class SimpleClient:
             return {'authorized': 'AUTHORIZED' in payload.upper(), 'assigned_storage': None}
 
     def _do_read(self, content_name: str, router_host: str, router_port: int, password: str = None):
-        """Perform authenticated READ: check permission, then request and save file."""
+        """Perform authenticated READ: check permission via router, then request file through router.
+        
+        All communication goes through the router (FIB topology) - client never contacts storage directly.
+        """
         # Normalize bare filenames or legacy '/files/' names to the storage namespace
         if content_name:
             if '/' not in content_name:
@@ -702,28 +719,27 @@ class SimpleClient:
                 base = content_name.split('/',2)[-1]
                 content_name = f"/dlsu/storage/{base}"
 
-        # Check permission with auth server first
+        # Check permission with auth server first (routed through R1 -> R2 -> Server)
         perm_result = self._check_permission(content_name, 'READ', password=password)
         if not perm_result.get('authorized'):
             msg = perm_result.get('message', 'Permission denied by AuthenticationServer')
             print(f"❌ {msg}")
             return False
         
-        # Check if server provided storage location (for direct access)
+        # Extract read_token for fragment access (avoids re-auth per fragment)
+        read_token = perm_result.get('read_token')
+        if read_token:
+            print(f"🔑 Read token issued for fragment access")
+        
+        # Log storage location info (for debugging) but ALWAYS route through router
         storage_location = perm_result.get('assigned_storage') or perm_result.get('storage_location')
         storage_node = perm_result.get('storage_node', 'unknown')
         if storage_location:
-            try:
-                storage_host, storage_port = storage_location.split(':')
-                storage_port = int(storage_port)
-                print(f"📦 File located at: {storage_host}:{storage_port} ({storage_node})")
-                # Read directly from storage node
-                return self.download_file(content_name, dest_path=None, host=storage_host, port=storage_port)
-            except Exception as e:
-                print(f"⚠️ Could not parse storage location, using router: {e}")
+            print(f"📦 File located at: {storage_location} ({storage_node}) - routing through R1")
         
-        # Fallback: use the improved download helper which routes through router
-        return self.download_file(content_name, dest_path=None, host=router_host, port=router_port)
+        # ALWAYS route through router - client never contacts storage directly
+        # The router will forward to the appropriate storage node based on FIB
+        return self.download_file(content_name, dest_path=None, host=router_host, port=router_port, read_token=read_token)
 
     def _do_delete(self, content_name: str, router_host: str = '127.0.0.1', router_port: int = 8001, password: str = None):
         """Perform authenticated DELETE: check ownership, then send DELETE Interest to storage via router."""
@@ -766,58 +782,64 @@ class SimpleClient:
             print("✗ No response from router (timeout)")
             return False
 
-    def _do_write(self, local_path: str, dest_name: str, storage_host: str = '127.0.0.1', storage_port: int = 9001, password: str = None, raid_preference: str = None):
-        """Perform authenticated WRITE: check permission, then upload file to storage host.
+    def _do_write(self, local_path: str, dest_name: str, storage_host: str = '127.0.0.1', storage_port: int = 9001, password: str = None, raid_preference: str = None, router_host: str = '127.0.0.1', router_port: int = 8001):
+        """Perform authenticated WRITE: check permission via router, then upload file through router.
         
-        If the server assigns a storage node, it will override the provided storage_host/port.
-        If raid_preference is provided (e.g., 'raid5'), the router will select appropriate storage.
+        All communication goes through the router (FIB topology) - client never contacts storage directly.
+        The router will forward write data to the assigned storage node.
         """
+        print(f"[DEBUG] _do_write called: dest_name={dest_name}, raid_preference={raid_preference}")
+        
         if not os.path.exists(local_path):
             print(f"Local file not found: {local_path}")
             return False
-        # If dest_name looks like a bare filename (no '/'), default to placing
-        # it under the storage namespace so routers can route to storage nodes.
+        
+        # Normalize dest_name to /dlsu/storage/ namespace for FIB routing
+        original_dest = dest_name
         if not dest_name or '/' not in dest_name:
+            # Bare filename - add full path
             base = os.path.basename(dest_name) if dest_name else os.path.basename(local_path)
-            # Embed RAID preference in the name for router to parse
             if raid_preference:
                 dest_name = f"/dlsu/storage/{raid_preference}/{base}"
             else:
                 dest_name = f"/dlsu/storage/{base}"
-        # Support legacy '/files/...' by mapping it into /dlsu/storage/
         elif dest_name.startswith('/files/'):
+            # Legacy /files/ path - convert to /dlsu/storage/
             base = dest_name.split('/',2)[-1]
             if raid_preference:
                 dest_name = f"/dlsu/storage/{raid_preference}/{base}"
             else:
                 dest_name = f"/dlsu/storage/{base}"
-        # If dest_name already has full path but no RAID prefix, add it if specified
+        elif dest_name.startswith('/dlsu/') and not dest_name.startswith('/dlsu/storage/'):
+            # Path like /dlsu/filename.txt - add storage namespace
+            base = dest_name[len('/dlsu/'):]
+            if raid_preference:
+                dest_name = f"/dlsu/storage/{raid_preference}/{base}"
+            else:
+                dest_name = f"/dlsu/storage/{base}"
         elif raid_preference and f'/{raid_preference}/' not in dest_name:
-            # Insert RAID preference after /dlsu/storage/
+            # Has full path but no RAID prefix - add it if specified
             if dest_name.startswith('/dlsu/storage/'):
                 remainder = dest_name[len('/dlsu/storage/'):]
                 dest_name = f"/dlsu/storage/{raid_preference}/{remainder}"
+        
+        print(f"[DEBUG] Path normalized: {original_dest} -> {dest_name}")
 
+        # Step 1: Check permission through router (R1 -> R2 -> Server)
         perm_result = self._check_permission(dest_name, 'WRITE', password=password)
         if not perm_result.get('authorized'):
             print("❌ Permission denied by AuthenticationServer")
             return False
 
-        # Use assigned storage from server if provided, otherwise use passed parameters
+        # Get assigned storage info (for logging only - all traffic still goes through router)
         assigned = perm_result.get('assigned_storage')
         storage_node = perm_result.get('storage_node', 'unknown')
         is_new_file = perm_result.get('is_new_file', True)
         if assigned:
-            try:
-                if ':' in str(assigned):
-                    storage_host, port_str = str(assigned).split(':', 1)
-                    storage_port = int(port_str)
-                    if is_new_file:
-                        print(f"📦 NEW FILE - Assigned to storage: {storage_host}:{storage_port}")
-                    else:
-                        print(f"📦 UPDATE - Existing file at: {storage_host}:{storage_port} ({storage_node})")
-            except Exception as e:
-                print(f"Warning: could not parse assigned storage '{assigned}', using default: {e}")
+            if is_new_file:
+                print(f"📦 NEW FILE - Assigned to storage: {assigned} - routing through R1")
+            else:
+                print(f"📦 UPDATE - Existing file at: {assigned} ({storage_node}) - routing through R1")
 
         try:
             with open(local_path, 'rb') as f:
@@ -826,33 +848,51 @@ class SimpleClient:
             print(f"Error reading local file: {e}")
             return False
 
-        # Fragment and send to storage (same logic as previous upload_file)
+        # Step 2: Send WRITE data through router (client -> R1 -> R2 -> storage)
         import json, base64
-        from common import DataPacket
+        from common import InterestPacket, DataPacket
 
         total_len = len(data)
-        # Match storage fragment size (keep conservative for UDP MTU)
-        fragment_size = 1024
+        # Use adaptive fragment sizing based on file size
+        fragment_size = get_optimal_fragment_size(total_len)
+
+        print(f"Uploading '{local_path}' -> '{dest_name}' via router ({len(data)} bytes, {fragment_size//1024}KB fragments)")
 
         if total_len <= fragment_size:
+            # Single packet write - send as Interest with WRITE operation and data payload
             wrapper = {"uploader": self.client_id, "data_b64": base64.b64encode(data).decode('utf-8')}
-            pkt = DataPacket(name=dest_name, data_payload=json.dumps(wrapper).encode('utf-8'))
-            pkt_json = pkt.to_json()
-            print(f"Uploading '{local_path}' -> '{dest_name}' to {storage_host}:{storage_port} ({len(data)} bytes)")
-            resp = self.comm_module.send_packet_sync(storage_host, storage_port, pkt_json)
-            # If storage responds with a Data packet that includes 'STORED', print and
-            # ensure the storage node registered ownership via auth server/DB
+            # Create WRITE Interest with data in a custom field
+            interest = InterestPacket(
+                name=dest_name,
+                user_id=self.client_id,
+                operation='WRITE_DATA',
+                auth_key=password
+            )
+            # Attach the data payload as a custom attribute
+            interest.write_payload = json.dumps(wrapper)
+            # Include assigned storage location so R2 knows where to forward
+            if assigned:
+                interest.target_storage = assigned
+            
+            resp = self.comm_module.send_packet_sync(router_host, router_port, interest.to_json())
             if resp:
                 try:
                     resp_pkt = DataPacket.from_json(resp)
-                    print(f"Upload response: {resp_pkt.name} - {resp_pkt.data_payload.decode('utf-8', errors='ignore')}")
-                except Exception:
-                    print(f"Upload response (raw): {resp[:200]}")
+                    payload_str = resp_pkt.data_payload.decode('utf-8', errors='ignore')
+                    if 'STORED' in payload_str.upper() or 'SUCCESS' in payload_str.upper():
+                        print(f"✓ Upload complete: {dest_name}")
+                        return True
+                    else:
+                        print(f"Upload response: {payload_str}")
+                        return 'STORED' in payload_str.upper()
+                except Exception as e:
+                    print(f"Upload response (raw): {resp[:200] if resp else 'None'}")
                 return True
             else:
-                print("No response (timeout) from target")
+                print("No response (timeout) from router")
                 return False
 
+        # Multi-fragment write
         fragments = [data[i:i+fragment_size] for i in range(0, total_len, fragment_size)]
         total = len(fragments)
         print(f"Uploading {total} fragments ({fragment_size} bytes each max)...")
@@ -860,10 +900,20 @@ class SimpleClient:
         for idx, chunk in enumerate(fragments, start=1):
             frag_name = f"{dest_name}:[{idx}/{total}]"
             wrapper = {"uploader": self.client_id, "data_b64": base64.b64encode(chunk).decode('utf-8')}
-            pkt = DataPacket(name=frag_name, data_payload=json.dumps(wrapper).encode('utf-8'))
-            pkt_json = pkt.to_json()
+            
+            # Create WRITE Interest with fragment data
+            interest = InterestPacket(
+                name=frag_name,
+                user_id=self.client_id,
+                operation='WRITE_DATA',
+                auth_key=password
+            )
+            interest.write_payload = json.dumps(wrapper)
+            # Include assigned storage location so R2 knows where to forward
+            if assigned:
+                interest.target_storage = assigned
 
-            resp = self.comm_module.send_packet_sync(storage_host, storage_port, pkt_json)
+            resp = self.comm_module.send_packet_sync(router_host, router_port, interest.to_json())
 
             if resp:
                 # Show progress every 10 fragments or on last fragment
@@ -878,10 +928,16 @@ class SimpleClient:
 
 
     def upload_file(self, local_path: str, dest_name: str, host: str = "127.0.0.1", port: int = 9001):
-        """Upload a local file to a storage node by sending a DataPacket with the file bytes."""
+        """DEPRECATED: Use _do_write() instead which routes through the router.
+        
+        This method sends directly to storage, bypassing FIB topology.
+        Kept for backward compatibility but should not be used in normal operation.
+        """
         import os
         import json, base64
         from common import DataPacket
+
+        print("⚠️ WARNING: upload_file() is deprecated. Use 'write' command which routes through router.")
 
         if not os.path.exists(local_path):
             print(f"Local file not found: {local_path}")
@@ -891,9 +947,8 @@ class SimpleClient:
             with open(local_path, 'rb') as f:
                 data = f.read()
             total_len = len(data)
-            # Conservative fragment payload size to avoid UDP limits (JSON+base64 overhead)
-            # Increased to 4KB to reduce fragment count; adjust if you see UDP errors.
-            fragment_size = 1024
+            # Use adaptive fragment sizing based on file size
+            fragment_size = get_optimal_fragment_size(total_len)
 
             if total_len <= fragment_size:
                 # Wrap payload with uploader metadata to allow storage node to record owner
@@ -952,12 +1007,15 @@ class SimpleClient:
             print(f"Error uploading file: {e}")
             return False
 
-    def download_file(self, content_name: str, dest_path: str = None, host: str = "127.0.0.1", port: int = 8001):
+    def download_file(self, content_name: str, dest_path: str = None, host: str = "127.0.0.1", port: int = 8001, read_token: str = None):
         """Download named content (READ) from the router/storage and save to disk.
 
         `content_name` is the logical name (e.g. `/dlsu/uploads/foo.zip`).
         If `dest_path` is None, the file is saved to the current directory using
         the basename of `content_name`.
+        
+        `read_token` is an optional multi-use token for fragment access that avoids
+        per-fragment permission checks.
         """
         from common import create_interest_packet, DataPacket, parse_fragment_notation
 
@@ -966,7 +1024,10 @@ class SimpleClient:
         os.makedirs(downloads_dir, exist_ok=True)
 
         # Request first fragment / packet synchronously from router
+        # Include read_token if provided to avoid re-auth
         interest = create_interest_packet(content_name, self.client_id, "READ")
+        if read_token:
+            interest.read_token = read_token
         print(f"Requesting download: {content_name} from {host}:{port}")
         resp = self.comm_module.send_packet_sync(host, port, interest.to_json())
 
@@ -1014,8 +1075,16 @@ class SimpleClient:
 
         # Collect fragments into list
         fragments = {idx0: pkt.data_payload}
+        
+        # Calculate expected size and set appropriate timeout
+        # With 8KB fragments, 1280 fragments = ~10MB, allow 30 seconds for large files
+        timeout_per_fragment = 10.0  # 10 seconds per fragment (generous for router delays)
+        
         # Show compact progress instead of per-fragment messages
-        print(f"Downloading {total} fragments...")
+        print(f"Downloading {total} fragments (8KB each, ~{total * 8 // 1024}MB total)...")
+        if read_token:
+            print(f"  Using read token for fragment access (no per-fragment auth)")
+        start_time = time.time()
 
         # Pull remaining fragments sequentially
         for i in range(1, total + 1):
@@ -1023,7 +1092,10 @@ class SimpleClient:
                 continue
             frag_name = f"{base}:[{i}/{total}]"
             frag_interest = create_interest_packet(frag_name, self.client_id, "READ")
-            resp_i = self.comm_module.send_packet_sync(host, port, frag_interest.to_json())
+            # Include read_token for fragment access (avoids per-fragment permission checks)
+            if read_token:
+                frag_interest.read_token = read_token
+            resp_i = self.comm_module.send_packet_sync(host, port, frag_interest.to_json(), timeout=timeout_per_fragment)
             if not resp_i:
                 print(f"❌ TIMEOUT requesting fragment {i}/{total}")
                 return False
@@ -1039,11 +1111,14 @@ class SimpleClient:
                 return False
 
             fragments[i] = pkt_i.data_payload
-            # Show progress every 10 fragments or on last fragment
-            if i % 10 == 0 or i == total:
-                print(f"  Progress: {i}/{total} fragments received")
+            # Show progress every 50 fragments or on last fragment (less noisy for large files)
+            if i % 50 == 0 or i == total:
+                elapsed = time.time() - start_time
+                pct = (i / total) * 100
+                print(f"  Progress: {i}/{total} ({pct:.1f}%) - {elapsed:.1f}s elapsed")
 
         # Reassemble
+        elapsed_total = time.time() - start_time
         content = b''.join(fragments[i] for i in range(1, total + 1))
         safe_name = os.path.basename(base) or f"download_{int(time.time())}"
         out_path = os.path.join(downloads_dir, safe_name)
@@ -1052,7 +1127,7 @@ class SimpleClient:
             out_path = f"{name}_{int(time.time())}{ext}"
         with open(out_path, 'wb') as wf:
             wf.write(content)
-        print(f"✓ Saved {len(content)} bytes to {out_path}")
+        print(f"✓ Saved {len(content)} bytes to {out_path} ({elapsed_total:.1f}s)")
         return True
 
 
@@ -1113,24 +1188,10 @@ def main():
             client.concurrent_test(router_host, router_port)
             return
     
-    # Quick demo
-    print("Running quick demo (3 UDP requests)...\n")
-    
-    demo_requests = [
-        ("/dlsu/hello", "READ", "Test cached content"),
-        ("/dlsu/storage/test", "READ", "Test storage request"),
-        ("/dlsu/hello", "READ", "Test cache hit (UDP)"),
-    ]
-    
-    for name, op, desc in demo_requests:
-        print(f"Demo: {desc}")
-        client.send_interest(name, op, router_host, router_port)
-        time.sleep(0.5)
-    
     # Interactive mode
-    print("\n" + "─"*70)
-    print("Demo complete! Entering interactive mode...")
-    print("─"*70)
+    print("-"*70)
+    print("Entering interactive mode...")
+    print("-"*70)
     
     try:
         client.interactive_mode(router_host, router_port)

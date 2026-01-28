@@ -3,6 +3,7 @@
 Storage Module - Named Networks Framework
 Core module for RAID implementation, file management, and storage operations
 Used by Storage Nodes to handle actual file storage and retrieval
+Includes XOR encryption for data-at-rest security
 """
 
 import os
@@ -10,8 +11,10 @@ import time
 import hashlib
 import threading
 import json
+import secrets
+import base64
 from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 class RAIDLevel(Enum):
@@ -32,6 +35,8 @@ class FileMetadata:
     file_path: str
     fragments: Dict[int, str] = None  # For fragmented files
     parity_paths: Dict[str, str] = None  # For RAID 5/6 parity files
+    encryption_key: str = None  # XOR encryption key (hex encoded)
+    is_encrypted: bool = False  # Whether file is encrypted
     
     def __post_init__(self):
         if self.fragments is None:
@@ -92,10 +97,61 @@ class StorageModule:
         # Load persisted metadata (if any) so stored files persist across restarts
         try:
             self._load_existing_metadata()
+            # Log summary of discovered files
+            file_count = len(self.stored_files)
+            if file_count > 0:
+                print(f"[{self.node_name}][STORAGE] ✓ Discovered {file_count} existing files on disk")
+                for fname in list(self.stored_files.keys())[:5]:  # Show first 5
+                    print(f"[{self.node_name}][STORAGE]   - {fname}")
+                if file_count > 5:
+                    print(f"[{self.node_name}][STORAGE]   ... and {file_count - 5} more")
+            else:
+                print(f"[{self.node_name}][STORAGE] No existing files found on disk")
         except Exception as e:
             print(f"[{self.node_name}][STORAGE] Warning: failed to load existing metadata: {e}")
         
         print(f"[{self.node_name}][STORAGE] Storage Module initialized for RAID {raid_level}")
+    
+    # ==================== XOR ENCRYPTION ====================
+    
+    def _generate_xor_key(self, key_length: int = 32) -> bytes:
+        """Generate a random XOR key for file encryption"""
+        return secrets.token_bytes(key_length)
+    
+    def _xor_cipher(self, data: bytes, key: bytes) -> bytes:
+        """
+        XOR cipher implementation for file encryption/decryption
+        XOR is symmetric: encrypt and decrypt use the same operation
+        """
+        # Repeat key to match data length
+        extended_key = (key * ((len(data) // len(key)) + 1))[:len(data)]
+        # XOR each byte
+        result = bytes([data[i] ^ extended_key[i] for i in range(len(data))])
+        return result
+    
+    def encrypt_content(self, content: bytes) -> Tuple[bytes, str]:
+        """
+        Encrypt content using XOR cipher
+        Returns: (encrypted_content, key_hex)
+        """
+        key = self._generate_xor_key(32)  # 256-bit key
+        encrypted = self._xor_cipher(content, key)
+        key_hex = key.hex()  # Convert key to hex string for storage/transmission
+        return encrypted, key_hex
+    
+    def decrypt_content(self, encrypted_content: bytes, key_hex: str) -> bytes:
+        """
+        Decrypt content using XOR cipher
+        Args:
+            encrypted_content: The encrypted bytes
+            key_hex: The hex-encoded encryption key
+        Returns: decrypted content
+        """
+        key = bytes.fromhex(key_hex)
+        decrypted = self._xor_cipher(encrypted_content, key)
+        return decrypted
+
+    # ==================== STORAGE OPERATIONS ====================
     
     def _initialize_storage(self):
         """Initialize storage directory structure"""
@@ -108,16 +164,36 @@ class StorageModule:
         
         print(f"[{self.node_name}][STORAGE] Storage initialized at {self.storage_path}")
     
-    def store_file(self, file_name: str, content: bytes) -> StorageResponse:
+    def store_file(self, file_name: str, content: bytes, encrypt: bool = True) -> StorageResponse:
         """
         Store file using the configured RAID level
         Main entry point for file storage operations
+        
+        Args:
+            file_name: Logical name for the file
+            content: Raw file content bytes
+            encrypt: Whether to encrypt the content (default True)
+        
+        Returns:
+            StorageResponse with encryption_key in storage_info if encrypted
         """
         try:
             print(f"[{self.node_name}][STORAGE] Storing file: {file_name} ({len(content)} bytes) with RAID {self.raid_level.value}")
             
+            # XOR encrypt content before storage
+            encryption_key = None
+            content_to_store = content
+            if encrypt:
+                content_to_store, encryption_key = self.encrypt_content(content)
+                print(f"[{self.node_name}][STORAGE] File encrypted with XOR (key: {encryption_key[:16]}...)")
+            
             # Apply RAID-specific processing
-            processed_content, storage_info = self._apply_raid_write(content, file_name)
+            processed_content, storage_info = self._apply_raid_write(content_to_store, file_name)
+            
+            # Add encryption info to storage_info
+            storage_info['encrypted'] = encrypt
+            if encryption_key:
+                storage_info['encryption_key'] = encryption_key
             
             # Generate storage path using the original basename so uploaded
             # hierarchical names like '/dlsu/uploads/foo.zip' become 'foo.zip'
@@ -138,15 +214,17 @@ class StorageModule:
             with open(file_path, 'wb') as f:
                 f.write(processed_content)
             
-            # Create and store metadata
+            # Create and store metadata (include encryption info)
             metadata = FileMetadata(
                 file_name=file_name,
                 original_size=len(content),
                 stored_size=len(processed_content),
                 raid_level=self.raid_level.value,
-                checksum=hashlib.md5(content).hexdigest(),
+                checksum=hashlib.md5(content).hexdigest(),  # Checksum of ORIGINAL content
                 stored_at=time.time(),
-                file_path=file_path
+                file_path=file_path,
+                encryption_key=encryption_key,
+                is_encrypted=encrypt
             )
             
             # Store metadata
@@ -154,6 +232,7 @@ class StorageModule:
                 self.stored_files[file_name] = metadata
             
             # Write metadata JSON for persistence
+            # NOTE: We do NOT store encryption key in local metadata - it goes to server only
             try:
                 meta_dir = os.path.join(self.storage_path, 'metadata')
                 os.makedirs(meta_dir, exist_ok=True)
@@ -165,7 +244,9 @@ class StorageModule:
                     "checksum": metadata.checksum,
                     "size": metadata.original_size,
                     "stored_at": time.strftime('%Y-%m-%d %H:%M:%S'),
-                    "fragments": {}
+                    "fragments": {},
+                    "is_encrypted": encrypt
+                    # encryption_key intentionally NOT stored locally - sent to server
                 }
                 with open(meta_path, 'w', encoding='utf-8') as mf:
                     json.dump(meta, mf, indent=2)
@@ -192,10 +273,18 @@ class StorageModule:
                 error=f"Storage error: {str(e)}"
             )
     
-    def retrieve_file(self, file_name: str) -> StorageResponse:
+    def retrieve_file(self, file_name: str, decryption_key: str = None) -> StorageResponse:
         """
         Retrieve file and apply RAID-specific processing
         Main entry point for file retrieval operations
+        
+        Args:
+            file_name: The logical name of the file to retrieve
+            decryption_key: Optional hex-encoded XOR key for decryption.
+                           If file is encrypted and key not provided, returns encrypted content.
+        
+        Returns:
+            StorageResponse with decrypted content if key provided, else encrypted content
         """
         try:
             print(f"[{self.node_name}][STORAGE] Retrieving file: {file_name}")
@@ -242,11 +331,24 @@ class StorageModule:
             # Apply RAID-specific read processing
             original_content = self._apply_raid_read(stored_content, metadata)
             
-            # Verify integrity
-            calculated_checksum = hashlib.md5(original_content).hexdigest()
-            if calculated_checksum != metadata.checksum:
-                print(f"[{self.node_name}][STORAGE] Warning: Checksum mismatch for {file_name}")
-                self.stats["error_corrections"] += 1
+            # Handle decryption if file is encrypted
+            is_encrypted = getattr(metadata, 'is_encrypted', False)
+            if is_encrypted:
+                if decryption_key:
+                    # Decrypt content using provided key
+                    original_content = self.decrypt_content(original_content, decryption_key)
+                    print(f"[{self.node_name}][STORAGE] Decrypted content with provided key")
+                else:
+                    # No key provided - return encrypted content
+                    # This allows storage to return data without knowing the key
+                    print(f"[{self.node_name}][STORAGE] File is encrypted, no key provided - returning encrypted content")
+            
+            # Verify integrity (only if we decrypted or file wasn't encrypted)
+            if not is_encrypted or decryption_key:
+                calculated_checksum = hashlib.md5(original_content).hexdigest()
+                if calculated_checksum != metadata.checksum:
+                    print(f"[{self.node_name}][STORAGE] Warning: Checksum mismatch for {file_name}")
+                    self.stats["error_corrections"] += 1
             
             # Update statistics
             self.stats["files_retrieved"] += 1
@@ -471,6 +573,98 @@ class StorageModule:
         
         return safe_name
 
+    def store_raid0_fragment(self, file_name: str, fragment_index: int, total_fragments: int, fragment_data: bytes) -> StorageResponse:
+        """Store a single RAID 0 fragment without waiting for all fragments.
+        
+        For RAID 0 striping, each storage node only receives a subset of fragments.
+        This method stores individual fragments and updates metadata incrementally.
+        
+        Args:
+            file_name: Base file name (without fragment notation)
+            fragment_index: 1-based fragment index
+            total_fragments: Total number of fragments in the complete file
+            fragment_data: The fragment content bytes
+            
+        Returns:
+            StorageResponse indicating success/failure
+        """
+        try:
+            base_name = os.path.basename(file_name) or file_name
+            safe_base = self._sanitize_filename(base_name)
+            
+            frag_dir = os.path.join(self.storage_path, 'fragments')
+            os.makedirs(frag_dir, exist_ok=True)
+            
+            # Store fragment file with index/total naming
+            frag_fname = f"{safe_base}_[{fragment_index}_{total_fragments}]"
+            frag_path = os.path.join(frag_dir, frag_fname)
+            
+            with open(frag_path, 'wb') as ff:
+                ff.write(fragment_data)
+            
+            # Update or create metadata for this file
+            with self._storage_lock:
+                existing_meta = self.stored_files.get(file_name)
+                
+                if existing_meta and hasattr(existing_meta, 'fragments') and existing_meta.fragments:
+                    # Add to existing fragments map
+                    existing_meta.fragments[fragment_index] = frag_path
+                    # Update stored size
+                    existing_meta.stored_size = existing_meta.stored_size + len(fragment_data)
+                    metadata = existing_meta
+                else:
+                    # Create new metadata for this file
+                    metadata = FileMetadata(
+                        file_name=file_name,
+                        original_size=-1,  # Unknown for RAID 0 partial storage
+                        stored_size=len(fragment_data),
+                        raid_level=0,  # RAID 0
+                        checksum='',  # Cannot compute until all fragments available
+                        stored_at=time.time(),
+                        file_path='',
+                        fragments={fragment_index: frag_path}
+                    )
+                    # Track total fragments expected
+                    metadata.total_fragments = total_fragments
+                
+                self.stored_files[file_name] = metadata
+            
+            # Also persist metadata to disk for recovery after restart
+            meta_dir = os.path.join(self.storage_path, 'metadata')
+            os.makedirs(meta_dir, exist_ok=True)
+            meta_path = os.path.join(meta_dir, f"{safe_base}_raid0.json")
+            
+            # Load existing metadata if present, then update
+            disk_meta = {}
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path, 'r') as f:
+                        disk_meta = json.load(f)
+                except:
+                    disk_meta = {}
+            
+            if 'fragments' not in disk_meta:
+                disk_meta['fragments'] = {}
+            disk_meta['fragments'][str(fragment_index)] = frag_path
+            disk_meta['total_fragments'] = total_fragments
+            disk_meta['file_name'] = file_name
+            disk_meta['raid_level'] = 0
+            disk_meta['updated_at'] = time.time()
+            
+            with open(meta_path, 'w') as f:
+                json.dump(disk_meta, f, indent=2)
+            
+            self.stats["files_stored"] += 1
+            self.stats["bytes_written"] += len(fragment_data)
+            self.stats["raid_operations"] += 1
+            
+            print(f"[{self.node_name}][STORAGE] RAID 0: Fragment {fragment_index}/{total_fragments} stored at {frag_path}")
+            
+            return StorageResponse(success=True, metadata=metadata)
+            
+        except Exception as e:
+            return StorageResponse(success=False, error=f"RAID 0 fragment storage error: {e}")
+
     def store_fragments(self, file_name: str, fragments: Dict[int, bytes]) -> StorageResponse:
         """Store fragments on disk under `fragments/` and record metadata.
 
@@ -494,16 +688,34 @@ class StorageModule:
             os.makedirs(frag_dir, exist_ok=True)
             os.makedirs(parity_dir, exist_ok=True)
 
+            # Check if this file already has fragments - if so, delete old ones first
+            with self._storage_lock:
+                existing_meta = self.stored_files.get(file_name)
+            if existing_meta and hasattr(existing_meta, 'fragments') and existing_meta.fragments:
+                # Delete old fragment files to allow overwrite
+                for old_idx, old_path in existing_meta.fragments.items():
+                    if os.path.exists(old_path):
+                        try:
+                            os.remove(old_path)
+                            print(f"[{self.node_name}][STORAGE] Removed old fragment: {old_path}")
+                        except Exception as e:
+                            print(f"[{self.node_name}][STORAGE] Warning: Could not remove old fragment {old_path}: {e}")
+                # Also delete old parity files if they exist
+                if hasattr(existing_meta, 'parity_paths') and existing_meta.parity_paths:
+                    for parity_key, parity_path in existing_meta.parity_paths.items():
+                        if os.path.exists(parity_path):
+                            try:
+                                os.remove(parity_path)
+                                print(f"[{self.node_name}][STORAGE] Removed old parity: {parity_path}")
+                            except Exception:
+                                pass
+
             fragments_map = {}
             total_stored = 0
             for idx in sorted(fragments.keys()):
                 frag_fname = f"{safe_base}_[{idx}_{len(fragments)}]"
                 frag_path = os.path.join(frag_dir, frag_fname)
-                # If exists, append timestamp
-                if os.path.exists(frag_path):
-                    name, ext = os.path.splitext(frag_fname)
-                    frag_fname = f"{name}_{int(time.time())}{ext}"
-                    frag_path = os.path.join(frag_dir, frag_fname)
+                # Overwrite existing fragment file (we already cleaned up old fragments above)
                 with open(frag_path, 'wb') as ff:
                     ff.write(fragments[idx])
                 fragments_map[idx] = frag_path
@@ -576,6 +788,41 @@ class StorageModule:
         safe_base = self._sanitize_filename(base_name)
         direct_path = os.path.join(self.storage_path, 'files', safe_base)
         
+        # First, check for RAID 0 metadata file (named *_raid0.json)
+        raid0_meta_path = os.path.join(meta_dir, f"{safe_base}_raid0.json")
+        if os.path.exists(raid0_meta_path):
+            try:
+                with open(raid0_meta_path, 'r', encoding='utf-8') as mf:
+                    meta = json.load(mf)
+                original_name = meta.get('file_name', file_name)
+                fragments_map = meta.get('fragments', {}) or {}
+                total_fragments = meta.get('total_fragments', len(fragments_map))
+                
+                # Convert fragment keys to int
+                frag_paths = {}
+                for k, v in fragments_map.items():
+                    try:
+                        frag_paths[int(k)] = v
+                    except Exception:
+                        pass
+                
+                if frag_paths:
+                    file_meta = FileMetadata(
+                        file_name=original_name,
+                        original_size=-1,  # Unknown for RAID 0 partial storage
+                        stored_size=sum(os.path.getsize(p) for p in frag_paths.values() if os.path.exists(p)),
+                        raid_level=0,  # RAID 0
+                        checksum='',
+                        stored_at=meta.get('updated_at', time.time()),
+                        file_path='',
+                        fragments=frag_paths
+                    )
+                    file_meta.total_fragments = total_fragments
+                    print(f"[{self.node_name}][STORAGE] Found RAID 0 fragments on disk: {original_name} ({len(frag_paths)}/{total_fragments} fragments)")
+                    return file_meta
+            except Exception as e:
+                print(f"[{self.node_name}][STORAGE] Error reading RAID 0 metadata {raid0_meta_path}: {e}")
+        
         for fname in os.listdir(meta_dir):
             if not fname.endswith('.json'):
                 continue
@@ -588,8 +835,34 @@ class StorageModule:
                 # Match by original name or by base name
                 if original_name == file_name or os.path.basename(original_name) == os.path.basename(file_name):
                     stored_path = meta.get('stored_path', '')
+                    
+                    # Handle RAID 0 fragment-only metadata (no stored_path)
+                    fragments_map = meta.get('fragments', {}) or {}
+                    if not stored_path and fragments_map:
+                        # RAID 0 fragment storage - no full file path
+                        frag_paths = {}
+                        for k, v in fragments_map.items():
+                            try:
+                                frag_paths[int(k)] = v
+                            except Exception:
+                                pass
+                        
+                        if frag_paths:
+                            file_meta = FileMetadata(
+                                file_name=original_name,
+                                original_size=-1,
+                                stored_size=sum(os.path.getsize(p) for p in frag_paths.values() if os.path.exists(p)),
+                                raid_level=0,
+                                checksum='',
+                                stored_at=time.time(),
+                                file_path='',
+                                fragments=frag_paths
+                            )
+                            file_meta.total_fragments = meta.get('total_fragments', len(frag_paths))
+                            print(f"[{self.node_name}][STORAGE] Found RAID 0 fragments: {original_name}")
+                            return file_meta
+                    
                     if stored_path and os.path.exists(stored_path):
-                        fragments_map = meta.get('fragments', {}) or {}
                         frag_paths = {}
                         for k, v in fragments_map.items():
                             try:
@@ -739,8 +1012,124 @@ class StorageModule:
         sorted_fragments = sorted(fragments.items())
         return b''.join([frag_data for _, frag_data in sorted_fragments])
     
+    def retrieve_fragment(self, file_name: str, fragment_index: int) -> StorageResponse:
+        """Retrieve a single fragment directly from disk (efficient for large files).
+        
+        For files stored as fragments, this reads only the requested fragment file
+        instead of reassembling the entire file. This is MUCH faster for large files.
+        
+        Args:
+            file_name: The base file name (without fragment notation)
+            fragment_index: 1-based fragment index to retrieve
+            
+        Returns:
+            StorageResponse with fragment content or error
+        """
+        try:
+            # Get file metadata
+            with self._storage_lock:
+                metadata = self.stored_files.get(file_name)
+            
+            if not metadata:
+                metadata = self._find_file_on_disk(file_name)
+                if metadata:
+                    with self._storage_lock:
+                        self.stored_files[file_name] = metadata
+            
+            if not metadata:
+                return StorageResponse(success=False, error=f"File not found: {file_name}")
+            
+            # If file has fragment paths, read directly from disk
+            if metadata.fragments and fragment_index in metadata.fragments:
+                frag_path = metadata.fragments[fragment_index]
+                if os.path.exists(frag_path):
+                    with open(frag_path, 'rb') as ff:
+                        frag_content = ff.read()
+                    return StorageResponse(
+                        success=True,
+                        content=frag_content,
+                        metadata=metadata,
+                        storage_info={"fragment_index": fragment_index, "total_fragments": len(metadata.fragments)}
+                    )
+                else:
+                    return StorageResponse(success=False, error=f"Fragment file not found: {frag_path}")
+            
+            # Fallback: If not stored as fragments, read full file and slice
+            # This handles non-fragment files or legacy storage
+            if metadata.file_path and os.path.exists(metadata.file_path):
+                with open(metadata.file_path, 'rb') as f:
+                    content = f.read()
+                
+                # Calculate fragment boundaries
+                from common import MAX_UDP_FRAGMENT_SIZE
+                frag_size = MAX_UDP_FRAGMENT_SIZE
+                total_frags = (len(content) + frag_size - 1) // frag_size
+                
+                if 1 <= fragment_index <= total_frags:
+                    start = (fragment_index - 1) * frag_size
+                    end = min(start + frag_size, len(content))
+                    frag_content = content[start:end]
+                    return StorageResponse(
+                        success=True,
+                        content=frag_content,
+                        metadata=metadata,
+                        storage_info={"fragment_index": fragment_index, "total_fragments": total_frags}
+                    )
+                else:
+                    return StorageResponse(success=False, error=f"Fragment index {fragment_index} out of range (1-{total_frags})")
+            
+            return StorageResponse(success=False, error=f"No valid storage path for {file_name}")
+            
+        except Exception as e:
+            return StorageResponse(success=False, error=f"Fragment retrieval error: {e}")
+    
+    def get_fragment_info(self, file_name: str) -> Optional[Dict]:
+        """Get fragment information for a file without reading content.
+        
+        Returns dict with total_fragments and fragment_size if file is large,
+        or None if file is small/single-packet.
+        """
+        with self._storage_lock:
+            metadata = self.stored_files.get(file_name)
+        
+        if not metadata:
+            metadata = self._find_file_on_disk(file_name)
+        
+        if not metadata:
+            return None
+        
+        # If stored as fragments, use fragment count
+        if metadata.fragments:
+            # For RAID 0, we store only a subset of fragments but know the total
+            total_frags = len(metadata.fragments)
+            if hasattr(metadata, 'total_fragments') and metadata.total_fragments:
+                total_frags = metadata.total_fragments
+            
+            # Also return which specific fragments this node has (for RAID 0)
+            available_fragments = list(metadata.fragments.keys())
+            
+            return {
+                "total_fragments": total_frags,
+                "fragment_size": 8192,  # MAX_UDP_FRAGMENT_SIZE
+                "total_size": metadata.original_size,
+                "available_fragments": available_fragments  # Which fragments this node has
+            }
+        
+        # Otherwise calculate based on file size
+        from common import MAX_UDP_FRAGMENT_SIZE
+        frag_size = MAX_UDP_FRAGMENT_SIZE
+        if metadata.original_size <= frag_size:
+            return None  # Single packet, no fragmentation needed
+        
+        total_frags = (metadata.original_size + frag_size - 1) // frag_size
+        return {
+            "total_fragments": total_frags,
+            "fragment_size": frag_size,
+            "total_size": metadata.original_size
+        }
+
     def delete_file(self, file_name: str) -> StorageResponse:
-        """Delete file from storage"""
+        """Delete file from storage including all fragments and parity files"""
         try:
             with self._storage_lock:
                 metadata = self.stored_files.get(file_name)
@@ -751,14 +1140,55 @@ class StorageModule:
                         error="File not found"
                     )
                 
-                # Remove physical file
-                if os.path.exists(metadata.file_path):
+                fragments_deleted = 0
+                parity_deleted = 0
+                
+                # Remove fragment files if they exist
+                if hasattr(metadata, 'fragments') and metadata.fragments:
+                    for frag_idx, frag_path in metadata.fragments.items():
+                        if frag_path and os.path.exists(frag_path):
+                            try:
+                                os.remove(frag_path)
+                                fragments_deleted += 1
+                            except Exception as e:
+                                print(f"[{self.node_name}][STORAGE] Warning: Could not delete fragment {frag_path}: {e}")
+                
+                # Remove parity files if they exist
+                if hasattr(metadata, 'parity_paths') and metadata.parity_paths:
+                    for parity_key, parity_path in metadata.parity_paths.items():
+                        if parity_path and os.path.exists(parity_path):
+                            try:
+                                os.remove(parity_path)
+                                parity_deleted += 1
+                            except Exception as e:
+                                print(f"[{self.node_name}][STORAGE] Warning: Could not delete parity {parity_path}: {e}")
+                
+                # Remove main physical file
+                if hasattr(metadata, 'file_path') and metadata.file_path and os.path.exists(metadata.file_path):
                     os.remove(metadata.file_path)
                 
-                # Remove from metadata
+                # Remove metadata JSON files (including RAID 0 metadata)
+                try:
+                    safe_name = self._sanitize_filename(os.path.basename(file_name) or file_name)
+                    meta_path = os.path.join(self.storage_path, 'metadata', f"{safe_name}.json")
+                    if os.path.exists(meta_path):
+                        os.remove(meta_path)
+                    # Also remove RAID 0 specific metadata
+                    raid0_meta_path = os.path.join(self.storage_path, 'metadata', f"{safe_name}_raid0.json")
+                    if os.path.exists(raid0_meta_path):
+                        os.remove(raid0_meta_path)
+                        print(f"[{self.node_name}][STORAGE]   - RAID 0 metadata removed")
+                except Exception:
+                    pass
+                
+                # Remove from in-memory index
                 del self.stored_files[file_name]
             
             print(f"[{self.node_name}][STORAGE] Successfully deleted {file_name}")
+            if fragments_deleted > 0:
+                print(f"[{self.node_name}][STORAGE]   - Fragments removed: {fragments_deleted}")
+            if parity_deleted > 0:
+                print(f"[{self.node_name}][STORAGE]   - Parity files removed: {parity_deleted}")
             
             return StorageResponse(success=True)
             

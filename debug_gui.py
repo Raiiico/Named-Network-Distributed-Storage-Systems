@@ -61,8 +61,8 @@ class DebugGUI:
         # Bottom status bar
         self._create_status_bar()
         
-        # Start queue processing
-        self.root.after(100, self._process_queues)
+        # Start queue processing (200ms interval to reduce GUI strain)
+        self.root.after(200, self._process_queues)
         
         return self.root
     
@@ -74,7 +74,7 @@ class DebugGUI:
         # Header
         header = tk.Label(
             left_frame, 
-            text="📋 Control Messages", 
+            text="Control Messages", 
             font=('Arial', 14, 'bold'),
             bg='#E3F2FD',
             pady=5
@@ -121,7 +121,7 @@ class DebugGUI:
         # Header
         header = tk.Label(
             right_frame,
-            text="🔍 Packet Debugging",
+            text="Packet Debugging",
             font=('Arial', 14, 'bold'),
             bg='#FFF3E0',
             pady=5
@@ -287,9 +287,9 @@ class DebugGUI:
         except queue.Empty:
             pass
         
-        # Schedule next update
+        # Schedule next update (200ms to reduce CPU usage)
         if self.root:
-            self.root.after(100, self._process_queues)
+            self.root.after(200, self._process_queues)
     
     def _clear_control(self):
         """Clear control messages panel"""

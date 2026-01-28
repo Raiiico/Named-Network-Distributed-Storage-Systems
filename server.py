@@ -82,6 +82,17 @@ class AuthToken:
 
 
 @dataclass
+class ReadToken:
+    """Multi-use read token for fragment access (not one-time)"""
+    token: str
+    user_id: str
+    resource_name: str  # Base resource name (without fragment notation)
+    issued_at: float
+    expires_at: float
+    access_count: int = 0  # Track how many times token was used
+
+
+@dataclass
 class SecurityResponse:
     """Response from security operations"""
     success: bool
@@ -89,6 +100,7 @@ class SecurityResponse:
     authorized: bool = False
     message: Optional[str] = None
     auth_token: Optional[str] = None
+    read_token: Optional[str] = None  # Multi-use token for fragment access
     encrypted_data: Optional[bytes] = None
     decrypted_data: Optional[bytes] = None
 
@@ -117,6 +129,11 @@ class SecurityModule:
         self.auth_tokens: Dict[str, AuthToken] = {}
         self.token_lock = threading.Lock()
         
+        # Read tokens (multi-use tokens for fragment access)
+        self.read_tokens: Dict[str, ReadToken] = {}  # token -> ReadToken
+        self.read_token_lock = threading.Lock()
+        self.read_token_ttl = 3600  # Read tokens valid for 1 hour (long reads)
+        
         # Encryption key (XOR cipher)
         self.encryption_key = self._generate_xor_key(32)  # 32 bytes = 256 bits
         
@@ -142,6 +159,8 @@ class SecurityModule:
             "permission_denials": 0,
             "tokens_issued": 0,
             "tokens_used": 0,
+            "read_tokens_issued": 0,
+            "read_tokens_validated": 0,
             "encryptions": 0,
             "decryptions": 0
         }
@@ -637,7 +656,114 @@ class SecurityModule:
                 message="Token valid"
             )
     
+    # ==================== READ TOKENS (MULTI-USE FOR FRAGMENTS) ====================
+    
+    def issue_read_token(self, user_id: str, resource_name: str) -> SecurityResponse:
+        """Issue a multi-use read token for fragment access.
+        
+        Unlike auth tokens (one-time), read tokens can be used multiple times
+        to access fragments of the same file without re-authenticating.
+        """
+        # Strip fragment notation to get base resource name
+        base_resource = resource_name.split(':[')[0] if ':[' in resource_name else resource_name
+        
+        # Generate secure token
+        token = secrets.token_urlsafe(32)
+        
+        # Create read token entry
+        read_token = ReadToken(
+            token=token,
+            user_id=user_id,
+            resource_name=base_resource,
+            issued_at=time.time(),
+            expires_at=time.time() + self.read_token_ttl,
+            access_count=0
+        )
+        
+        with self.read_token_lock:
+            self.read_tokens[token] = read_token
+            self.stats["read_tokens_issued"] += 1
+        
+        print(f"[{self.node_name}][SECURITY] Issued READ token for {user_id} -> {base_resource} (TTL={self.read_token_ttl}s)")
+        
+        return SecurityResponse(
+            success=True,
+            user_id=user_id,
+            read_token=token,
+            message="Read token issued"
+        )
+    
+    def validate_read_token(self, token: str, resource_name: str) -> SecurityResponse:
+        """Validate a read token for fragment access.
+        
+        Unlike auth tokens, read tokens are NOT consumed on use - they can be
+        used multiple times until they expire.
+        
+        Args:
+            token: The read token to validate
+            resource_name: The resource being accessed (with or without fragment notation)
+            
+        Returns:
+            SecurityResponse with authorized=True if valid
+        """
+        # Strip fragment notation to get base resource name for comparison
+        base_resource = resource_name.split(':[')[0] if ':[' in resource_name else resource_name
+        
+        with self.read_token_lock:
+            read_token = self.read_tokens.get(token)
+            
+            if not read_token:
+                return SecurityResponse(
+                    success=False,
+                    authorized=False,
+                    message="Invalid read token"
+                )
+            
+            # Check if expired
+            if time.time() > read_token.expires_at:
+                # Clean up expired token
+                del self.read_tokens[token]
+                return SecurityResponse(
+                    success=False,
+                    authorized=False,
+                    message="Read token expired"
+                )
+            
+            # Validate resource name matches (base name, ignoring fragments)
+            if read_token.resource_name != base_resource:
+                return SecurityResponse(
+                    success=False,
+                    authorized=False,
+                    message=f"Token not valid for resource {base_resource}"
+                )
+            
+            # Token is valid - increment access count (not consumed)
+            read_token.access_count += 1
+            self.stats["read_tokens_validated"] += 1
+            
+            # Log every 50 validations to avoid spam for large files
+            if read_token.access_count == 1 or read_token.access_count % 50 == 0:
+                print(f"[{self.node_name}][SECURITY] ✓ Read token validated: {read_token.user_id} -> {base_resource} (access #{read_token.access_count})")
+            
+            return SecurityResponse(
+                success=True,
+                user_id=read_token.user_id,
+                authorized=True,
+                message="Read token valid"
+            )
+    
+    def cleanup_expired_read_tokens(self):
+        """Remove expired read tokens from cache"""
+        now = time.time()
+        with self.read_token_lock:
+            expired = [t for t, rt in self.read_tokens.items() if now > rt.expires_at]
+            for t in expired:
+                del self.read_tokens[t]
+            if expired:
+                print(f"[{self.node_name}][SECURITY] Cleaned up {len(expired)} expired read tokens")
+    
     # ==================== ENCRYPTION (XOR CIPHER) ====================
+
     
     def _generate_xor_key(self, key_length: int) -> bytes:
         """Generate a random XOR key"""
@@ -895,6 +1021,157 @@ class AuthenticationServer:
             self.logger = PacketLogger(self.security.node_name)
         except Exception:
             self.logger = None
+        
+        # Initialize RAID groups from fib_config
+        self._init_raid_groups()
+    
+    def _init_raid_groups(self):
+        """Initialize RAID groups from fib_config and register in DB"""
+        if self.db is None:
+            print("[AuthServer] No DB available, skipping RAID group init")
+            return
+        
+        try:
+            from fib_config import RAID_GROUPS, DEFAULT_RAID_LEVEL
+            self._default_raid_level = DEFAULT_RAID_LEVEL
+            
+            for group_name, config in RAID_GROUPS.items():
+                # Create RAID group in DB
+                try:
+                    self.db.create_raid_group(
+                        group_name=group_name,
+                        raid_level=config['level'],
+                        min_nodes=config.get('min_nodes', 2)
+                    )
+                    print(f"[AuthServer] Registered RAID group: {group_name} ({config['level']})")
+                    
+                    # Register nodes in the group
+                    for node in config['nodes']:
+                        self.db.register_storage_node(
+                            node_name=node['name'],
+                            host=node['host'],
+                            port=node['port'],
+                            raid_mode=config['level'],
+                            raid_group_name=group_name
+                        )
+                        print(f"[AuthServer]   - Node {node['name']} at {node['host']}:{node['port']}")
+                except Exception as e:
+                    print(f"[AuthServer] Warning: Could not init RAID group {group_name}: {e}")
+        except ImportError:
+            print("[AuthServer] fib_config.RAID_GROUPS not found, using legacy storage assignment")
+            self._default_raid_level = 'raid1'
+    
+    def _select_raid_storage(self, raid_preference: str = None) -> dict:
+        """
+        Select storage node(s) based on RAID level preference.
+        
+        If no preference specified, cycles through RAID levels: raid0 → raid1 → raid5 → raid6
+        Each file goes to the PRIMARY node of the selected RAID group.
+        RAID operations (mirroring, parity) happen after storing to primary.
+        
+        Returns dict with:
+          - node_name: primary storage node
+          - host: node host
+          - port: node port
+          - raid_level: the RAID level selected
+          - stripe_nodes: (for RAID 0) list of all nodes for striping
+          - replica_nodes: (for RAID 1/5/6) list of other nodes for replication
+        """
+        if self.db is None:
+            # Fallback to default
+            return {'node_name': 'ST1-A', 'host': '127.0.0.1', 'port': 9003, 'raid_level': 'raid1'}
+        
+        # If user specified a RAID preference, use that level
+        if raid_preference in ['raid0', 'raid1', 'raid5', 'raid6']:
+            raid_level = raid_preference
+        else:
+            # No preference: round-robin across RAID levels
+            raid_levels = ['raid0', 'raid1', 'raid5', 'raid6']
+            
+            # Get or initialize the RAID level round-robin counter
+            if not hasattr(self, '_raid_level_counter'):
+                self._raid_level_counter = 0
+            
+            raid_level = raid_levels[self._raid_level_counter % len(raid_levels)]
+            self._raid_level_counter += 1
+            print(f"[AuthServer] Round-robin RAID level: {raid_level} (counter={self._raid_level_counter})")
+        
+        # Get the group for this RAID level
+        groups = self.db.get_raid_groups_by_level(raid_level)
+        
+        if not groups:
+            # Fall back to any available storage node
+            print(f"[AuthServer] No {raid_level} groups available, falling back to any node")
+            all_nodes = self.db.list_storage_nodes()
+            active = [n for n in all_nodes if n.get('active', True)]
+            if active:
+                node = active[0]
+                return {
+                    'node_name': node['node_name'],
+                    'host': node.get('host', '127.0.0.1'),
+                    'port': node.get('port', 9001),
+                    'raid_level': node.get('raid_mode', 'unknown')
+                }
+            return None
+        
+        # Select the first (and typically only) group for this RAID level
+        selected_group = groups[0]
+        active_nodes = [n for n in selected_group.get('nodes', []) if n.get('active', True)]
+        
+        if not active_nodes:
+            print(f"[AuthServer] No active nodes in {raid_level} group {selected_group['group_name']}")
+            return None
+        
+        # Primary node is always the first active node
+        primary = active_nodes[0]
+        
+        # Build replica/stripe node list (all nodes except primary)
+        other_nodes = [
+            {'name': n['node_name'], 'host': n.get('host', '127.0.0.1'), 'port': n.get('port', 9001)}
+            for n in active_nodes[1:]
+        ]
+        
+        result = {
+            'node_name': primary['node_name'],
+            'host': primary.get('host', '127.0.0.1'),
+            'port': primary.get('port', 9001),
+            'raid_level': raid_level
+        }
+        
+        # For RAID 0: include all nodes for striping
+        if raid_level == 'raid0':
+            result['stripe_nodes'] = [
+                {'name': n['node_name'], 'host': n.get('host', '127.0.0.1'), 'port': n.get('port', 9001)}
+                for n in active_nodes
+            ]
+        else:
+            # For RAID 1/5/6: include replica nodes for post-store replication
+            result['replica_nodes'] = other_nodes
+        
+        print(f"[AuthServer] Selected {raid_level.upper()} primary: {primary['node_name']} ({primary.get('host')}:{primary.get('port')})")
+        
+        return result
+    
+    def _check_node_health(self, node_name: str, host: str, port: int, timeout: float = 0.5) -> bool:
+        """Check if a storage node is responsive (for failover detection)"""
+        import socket
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            # Send a simple ping Interest
+            ping_msg = '{"type":"INTEREST","name":"/dlsu/ping","operation":"PING"}'
+            sock.sendto(ping_msg.encode('utf-8'), (host, port))
+            data, _ = sock.recvfrom(1024)
+            sock.close()
+            return True
+        except Exception:
+            return False
+    
+    def _handle_node_failure(self, node_name: str):
+        """Mark a node as inactive and trigger failover logic"""
+        if self.db:
+            self.db.mark_node_inactive(node_name)
+            print(f"[AuthServer] Marked node {node_name} as INACTIVE (failover)")
 
     def start(self):
         import threading
@@ -957,6 +1234,128 @@ class AuthenticationServer:
                         user_id = interest.user_id.lower() if interest.user_id else None  # Normalize to lowercase
                         password = interest.auth_key
                         operation = (interest.operation or '').upper()
+
+                        # Handle REGISTER_FILE (storage node registering file ownership)
+                        if operation == 'REGISTER_FILE' and '/server/register_file' in resource:
+                            try:
+                                file_resource = getattr(interest, 'resource', None)
+                                owner = getattr(interest, 'owner', None) or user_id
+                                if not file_resource or not owner:
+                                    payload = {'error': 'Missing resource or owner', 'success': False}
+                                else:
+                                    # Strip fragment notation
+                                    base_resource = self._strip_fragment_notation(file_resource)
+                                    # Register in DB
+                                    if self.db is not None:
+                                        try:
+                                            self.db.add_file(base_resource, owner.lower())
+                                            payload = {'success': True, 'message': f'Registered {base_resource} (owner: {owner})'}
+                                            print(f"[AuthServer] REGISTER_FILE: {base_resource} owner={owner}")
+                                        except Exception:
+                                            payload = {'success': True, 'message': f'{base_resource} already registered'}
+                                    else:
+                                        # Fallback to in-memory ACL
+                                        result = self.security.create_resource_acl(base_resource, owner)
+                                        payload = {'success': result.success, 'message': result.message}
+                                dp = DataPacket(name=resource, data_payload=json.dumps(payload).encode('utf-8'))
+                                resp = dp.to_json()
+                                self.socket.sendto(resp.encode('utf-8'), addr)
+                                try:
+                                    if hasattr(self, 'logger'):
+                                        self.logger.log('SEND', 'DATA', json.loads(resp), addr)
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                payload = {'error': str(e), 'success': False}
+                                dp = DataPacket(name=resource, data_payload=json.dumps(payload).encode('utf-8'))
+                                self.socket.sendto(dp.to_json().encode('utf-8'), addr)
+                            continue
+
+                        # Handle REGISTER_LOCATION (storage node registering file location)
+                        if operation == 'REGISTER_LOCATION' and '/server/register_location' in resource:
+                            try:
+                                file_resource = getattr(interest, 'resource', None)
+                                node_name = getattr(interest, 'node_name', None)
+                                storage_host = getattr(interest, 'storage_host', None)
+                                storage_port = getattr(interest, 'storage_port', None)
+                                stored_path = getattr(interest, 'stored_path', None)
+                                owner = getattr(interest, 'owner', None) or user_id
+                                
+                                if not file_resource or not node_name:
+                                    payload = {'error': 'Missing resource or node_name', 'success': False}
+                                else:
+                                    base_resource = self._strip_fragment_notation(file_resource)
+                                    if self.db is not None:
+                                        try:
+                                            # Ensure node record exists
+                                            self.db.register_storage_node(node_name, storage_host, storage_port)
+                                            
+                                            # Check if file exists; if not, create with owner
+                                            existing_file = self.db.get_file_by_name(base_resource)
+                                            if not existing_file and owner:
+                                                try:
+                                                    self.db.add_file(base_resource, owner.lower(), size=0, storage_path=stored_path)
+                                                    print(f"[AuthServer] REGISTER_LOCATION: Created file {base_resource} owner={owner}")
+                                                except Exception as e:
+                                                    print(f"[AuthServer] REGISTER_LOCATION: Could not create file: {e}")
+                                            
+                                            # Add file location
+                                            self.db.add_file_location(base_resource, node_name, stored_path, host=storage_host, port=storage_port)
+                                            payload = {'success': True, 'message': f'Registered location for {base_resource} on {node_name}'}
+                                            print(f"[AuthServer] REGISTER_LOCATION: {base_resource} -> {node_name} ({storage_host}:{storage_port})")
+                                        except Exception as e:
+                                            payload = {'error': str(e), 'success': False}
+                                    else:
+                                        payload = {'success': False, 'message': 'No DB available'}
+                                dp = DataPacket(name=resource, data_payload=json.dumps(payload).encode('utf-8'))
+                                resp = dp.to_json()
+                                self.socket.sendto(resp.encode('utf-8'), addr)
+                                try:
+                                    if hasattr(self, 'logger'):
+                                        self.logger.log('SEND', 'DATA', json.loads(resp), addr)
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                payload = {'error': str(e), 'success': False}
+                                dp = DataPacket(name=resource, data_payload=json.dumps(payload).encode('utf-8'))
+                                self.socket.sendto(dp.to_json().encode('utf-8'), addr)
+                            continue
+
+                        # Handle STORE_KEY (storage node sending encryption key for secure storage)
+                        if operation == 'STORE_KEY' and '/server/store_key' in resource:
+                            try:
+                                file_resource = getattr(interest, 'resource', None)
+                                encryption_key = getattr(interest, 'encryption_key', None)
+                                
+                                if not file_resource or not encryption_key:
+                                    payload = {'error': 'Missing resource or encryption_key', 'success': False}
+                                else:
+                                    base_resource = self._strip_fragment_notation(file_resource)
+                                    if self.db is not None:
+                                        try:
+                                            result = self.db.store_encryption_key(base_resource, encryption_key)
+                                            if result:
+                                                payload = {'success': True, 'message': f'Encryption key stored for {base_resource}'}
+                                                print(f"[AuthServer] STORE_KEY: Stored encryption key for {base_resource}")
+                                            else:
+                                                payload = {'success': False, 'message': 'Failed to store encryption key'}
+                                        except Exception as e:
+                                            payload = {'error': str(e), 'success': False}
+                                    else:
+                                        payload = {'success': False, 'message': 'No DB available'}
+                                dp = DataPacket(name=resource, data_payload=json.dumps(payload).encode('utf-8'))
+                                resp = dp.to_json()
+                                self.socket.sendto(resp.encode('utf-8'), addr)
+                                try:
+                                    if hasattr(self, 'logger'):
+                                        self.logger.log('SEND', 'DATA', json.loads(resp), addr)
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                payload = {'error': str(e), 'success': False}
+                                dp = DataPacket(name=resource, data_payload=json.dumps(payload).encode('utf-8'))
+                                self.socket.sendto(dp.to_json().encode('utf-8'), addr)
+                            continue
 
                         # Handle LIST (myfiles)
                         if operation == 'LIST' and ('/server/myfiles' in resource or '/dlsu/server/myfiles' in resource):
@@ -1231,12 +1630,59 @@ class AuthenticationServer:
                                             resp_obj['is_new_file'] = False
                                             print(f"[AuthServer] File {base_resource} found at {resp_obj['storage_location']}")
                                         else:
-                                            # File doesn't exist - mark as new for WRITE operations
+                                            # File doesn't have location yet
                                             if op_check == 'WRITE':
+                                                # For NEW WRITE: Server assigns storage using RAID-aware selection
                                                 resp_obj['is_new_file'] = True
-                                                print(f"[AuthServer] File {base_resource} is NEW - router will assign storage")
+                                                
+                                                # Get RAID preference from interest or use default
+                                                raid_preference = getattr(interest, 'raid_preference', None)
+                                                if not raid_preference:
+                                                    # Check if path contains RAID level hint (e.g., /dlsu/storage/raid5/file.txt)
+                                                    for level in ['raid0', 'raid1', 'raid5', 'raid6']:
+                                                        if f'/{level}/' in base_resource:
+                                                            raid_preference = level
+                                                            break
+                                                
+                                                # Use RAID-aware storage selection
+                                                storage_result = self._select_raid_storage(raid_preference)
+                                                
+                                                if storage_result:
+                                                    node_name = storage_result['node_name']
+                                                    node_host = storage_result['host']
+                                                    node_port = storage_result['port']
+                                                    raid_level = storage_result.get('raid_level', 'raid1')
+                                                    
+                                                    # First create the file record with the correct owner
+                                                    try:
+                                                        self.db.add_file(base_resource, user_id.lower(), size=0, storage_path=None)
+                                                        print(f"[AuthServer] Created file record for {base_resource} owned by {user_id}")
+                                                    except Exception as file_add_err:
+                                                        print(f"[AuthServer] Note: Could not add file (may already exist): {file_add_err}")
+                                                    
+                                                    # Record file location in DB
+                                                    try:
+                                                        self.db.add_file_location(base_resource, node_name, stored_path=None, host=node_host, port=node_port)
+                                                        print(f"[AuthServer] Assigned {raid_level.upper()} storage for NEW file {base_resource}: {node_name} ({node_host}:{node_port})")
+                                                    except Exception as loc_add_err:
+                                                        print(f"[AuthServer] Warning: Could not pre-register location: {loc_add_err}")
+                                                    
+                                                    resp_obj['storage_location'] = f"{node_host}:{node_port}"
+                                                    resp_obj['storage_node'] = node_name
+                                                    resp_obj['raid_level'] = raid_level
+                                                    
+                                                    # For RAID 0 (striping), include all nodes in group
+                                                    if raid_level == 'raid0' and 'stripe_nodes' in storage_result:
+                                                        resp_obj['stripe_nodes'] = storage_result['stripe_nodes']
+                                                        resp_obj['is_striped'] = True
+                                                else:
+                                                    # No storage nodes available - use default
+                                                    print(f"[AuthServer] No RAID storage available, using default 127.0.0.1:9003")
+                                                    resp_obj['storage_location'] = "127.0.0.1:9003"
+                                                    resp_obj['storage_node'] = "ST1-A"
+                                                    
                                             elif op_check == 'READ':
-                                                # For READ, file must exist
+                                                # For READ, file must exist with location
                                                 resp_obj['authorized'] = False
                                                 resp_obj['status'] = 'denied'
                                                 resp_obj['message'] = f"File not found: {base_resource}"
@@ -1324,10 +1770,40 @@ class AuthenticationServer:
                     self.socket.sendto(resp_text.encode('utf-8'), addr)
                     continue
 
+                elif action == 'register_node':
+                    # Storage node registration (infrastructure action, no auth required)
+                    node_name = req.get('node_name')
+                    host = req.get('host', '127.0.0.1')
+                    port = req.get('port')
+                    raid_level = req.get('raid_level', 0)
+                    
+                    if not node_name or not port:
+                        resp_text = json.dumps({'success': False, 'message': 'Missing node_name or port'})
+                        self.socket.sendto(resp_text.encode('utf-8'), addr)
+                        continue
+                    
+                    try:
+                        port_int = int(port)
+                        raid_int = int(raid_level)
+                        if self.db is not None:
+                            self.db.register_storage_node(node_name, host, port_int)
+                            print(f"[AuthServer] Registered storage node: {node_name} at {host}:{port_int} (RAID {raid_int})")
+                            resp_text = json.dumps({'success': True, 'message': f'Node {node_name} registered'})
+                        else:
+                            resp_text = json.dumps({'success': False, 'message': 'No database available'})
+                    except Exception as e:
+                        print(f"[AuthServer] Failed to register node {node_name}: {e}")
+                        resp_text = json.dumps({'success': False, 'message': str(e)})
+                    
+                    self.socket.sendto(resp_text.encode('utf-8'), addr)
+                    continue
+
                 elif action == 'grant':
                     # Grant permission: owner grants target_user access to resource
+                    # perm_level: 'READ' = read only, 'WRITE' = read+write
                     owner = req.get('owner')
                     target_user = req.get('target_user')
+                    perm_level = req.get('perm_level', 'READ').upper()
                     if not all([owner, target_user, resource, password]):
                         resp_text = "DENIED: Missing parameters (owner, target_user, resource, password)"
                         self.socket.sendto(resp_text.encode('utf-8'), addr)
@@ -1340,11 +1816,20 @@ class AuthenticationServer:
                         self.socket.sendto(resp_text.encode('utf-8'), addr)
                         continue
                     
-                    # Grant READ permission
+                    # Determine permission value based on perm_level
                     from security_module import PermissionLevel
-                    result = self.security.grant_permission(resource, target_user, PermissionLevel.READ.value, owner)
+                    if perm_level == 'WRITE':
+                        # WRITE implies READ + WRITE
+                        perm_value = PermissionLevel.READ.value | PermissionLevel.WRITE.value
+                        perm_desc = "READ+WRITE"
+                    else:
+                        # Default to READ only
+                        perm_value = PermissionLevel.READ.value
+                        perm_desc = "READ"
+                    
+                    result = self.security.grant_permission(resource, target_user, perm_value, owner)
                     if result.success:
-                        resp_text = f"SUCCESS: Granted READ access to {target_user} on {resource}"
+                        resp_text = f"SUCCESS: Granted {perm_desc} access to {target_user} on {resource}"
                     else:
                         resp_text = f"FAILED: {result.message}"
                     self.socket.sendto(resp_text.encode('utf-8'), addr)
@@ -1352,8 +1837,10 @@ class AuthenticationServer:
 
                 elif action == 'revoke':
                     # Revoke permission
+                    # revoke_mode: 'ALL' = revoke everything, 'WRITE' = revoke only write (keep read)
                     owner = req.get('owner')
                     target_user = req.get('target_user')
+                    revoke_mode = req.get('revoke_mode', 'ALL').upper()
                     if not all([owner, target_user, resource, password]):
                         resp_text = "DENIED: Missing parameters"
                         self.socket.sendto(resp_text.encode('utf-8'), addr)
@@ -1365,11 +1852,20 @@ class AuthenticationServer:
                         self.socket.sendto(resp_text.encode('utf-8'), addr)
                         continue
                     
-                    result = self.security.revoke_permission(resource, target_user, owner)
-                    if result.success:
-                        resp_text = f"SUCCESS: Revoked access for {target_user} on {resource}"
+                    if revoke_mode == 'WRITE':
+                        # Partial revoke - remove only WRITE, keep READ
+                        result = self.security.revoke_write_permission(resource, target_user, owner)
+                        if result.success:
+                            resp_text = f"SUCCESS: Revoked WRITE access for {target_user} on {resource} (READ still allowed)"
+                        else:
+                            resp_text = f"FAILED: {result.message}"
                     else:
-                        resp_text = f"FAILED: {result.message}"
+                        # Full revoke - remove all permissions
+                        result = self.security.revoke_permission(resource, target_user, owner)
+                        if result.success:
+                            resp_text = f"SUCCESS: Revoked all access for {target_user} on {resource}"
+                        else:
+                            resp_text = f"FAILED: {result.message}"
                     self.socket.sendto(resp_text.encode('utf-8'), addr)
                     continue
 
@@ -1695,6 +2191,14 @@ class AuthenticationServer:
                     "authorized": bool(perm.authorized),
                     "message": (f"AUTHORIZED: {user_id} -> {base_resource} ({op})" if perm.authorized else f"DENIED: {user_id} -> {base_resource} ({op})")
                 }
+                
+                # Issue read token for authorized READ operations
+                # This allows clients to access fragments without re-authenticating
+                if perm.authorized and op == 'READ':
+                    read_token_resp = self.security.issue_read_token(user_id, base_resource)
+                    if read_token_resp.success and read_token_resp.read_token:
+                        resp_obj["read_token"] = read_token_resp.read_token
+                        print(f"[AuthServer] Issued read_token for {user_id} -> {base_resource}")
 
                 # Reply using the incoming Interest name so routers can match PITs (typically '/dlsu/server/auth')
                 reply_name = interest.name if getattr(interest, 'name', None) else f"/dlsu/server/auth{base_resource}"
@@ -1997,13 +2501,19 @@ class AuthenticationServer:
             except Exception as e:
                 print(f"  ✗ Error clearing DB: {e}")
         
-        # Send CLEAR to all known storage nodes
-        storage_nodes = [
-            ('127.0.0.1', 9001, 'ST1'),
-            ('127.0.0.1', 9002, 'ST2'),
-            ('127.0.0.1', 9003, 'ST3'),
-            ('127.0.0.1', 9004, 'ST4'),
-        ]
+        # Send CLEAR to all known storage nodes from fib_config
+        storage_nodes = []
+        try:
+            from fib_config import RAID_GROUPS
+            for group_name, config in RAID_GROUPS.items():
+                for node in config['nodes']:
+                    storage_nodes.append((node['host'], node['port'], node['name']))
+        except ImportError:
+            # Fallback
+            storage_nodes = [
+                ('127.0.0.1', 9003, 'ST1-A'),
+                ('127.0.0.1', 9004, 'ST1-B'),
+            ]
         
         import socket
         for host, port, name in storage_nodes:

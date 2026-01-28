@@ -175,7 +175,7 @@ class ParsingModule:
             return {"valid": False, "error": "Invalid content name format"}
         
         # Validate operation
-        valid_operations = ["READ", "WRITE", "PERMISSION", "DELETE", "LIST", "GRANT", "REVOKE", "STATS", "CLEAR", "INFO", "EXECUTE"]
+        valid_operations = ["READ", "WRITE", "WRITE_DATA", "PERMISSION", "DELETE", "LIST", "GRANT", "REVOKE", "STATS", "CLEAR", "INFO", "EXECUTE", "REGISTER_FILE", "REGISTER_LOCATION"]
         if interest.operation.upper() not in valid_operations:
             return {"valid": False, "error": f"Invalid operation: {interest.operation}"}
         
