@@ -972,8 +972,23 @@ class AuthenticationServer:
       - operation: READ/WRITE
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 7001):
+    def __init__(self, host: str = None, port: int = None):
         import socket
+        
+        # Import network config for defaults
+        try:
+            from network_config import get_server_address, DEFAULT_HOST
+            _srv_host, _srv_port = get_server_address()
+            _default_host = DEFAULT_HOST
+        except ImportError:
+            _srv_host, _srv_port = '127.0.0.1', 7001
+            _default_host = '127.0.0.1'
+        
+        if host is None:
+            host = _srv_host
+        if port is None:
+            port = _srv_port
+        
         # Lazy import DB getters to avoid circular imports at module import time
         try:
             from db import get_db
@@ -1077,9 +1092,15 @@ class AuthenticationServer:
           - stripe_nodes: (for RAID 0) list of all nodes for striping
           - replica_nodes: (for RAID 1/5/6) list of other nodes for replication
         """
+        try:
+            from network_config import DEFAULT_HOST
+            _default_host = DEFAULT_HOST
+        except ImportError:
+            _default_host = '127.0.0.1'
+            
         if self.db is None:
             # Fallback to default
-            return {'node_name': 'ST1-A', 'host': '127.0.0.1', 'port': 9003, 'raid_level': 'raid1'}
+            return {'node_name': 'ST1-A', 'host': _default_host, 'port': 9003, 'raid_level': 'raid1'}
         
         # If user specified a RAID preference, use that level
         if raid_preference in ['raid0', 'raid1', 'raid5', 'raid6']:
@@ -1108,7 +1129,7 @@ class AuthenticationServer:
                 node = active[0]
                 return {
                     'node_name': node['node_name'],
-                    'host': node.get('host', '127.0.0.1'),
+                    'host': node.get('host', _default_host),
                     'port': node.get('port', 9001),
                     'raid_level': node.get('raid_mode', 'unknown')
                 }
@@ -1127,13 +1148,13 @@ class AuthenticationServer:
         
         # Build replica/stripe node list (all nodes except primary)
         other_nodes = [
-            {'name': n['node_name'], 'host': n.get('host', '127.0.0.1'), 'port': n.get('port', 9001)}
+            {'name': n['node_name'], 'host': n.get('host', _default_host), 'port': n.get('port', 9001)}
             for n in active_nodes[1:]
         ]
         
         result = {
             'node_name': primary['node_name'],
-            'host': primary.get('host', '127.0.0.1'),
+            'host': primary.get('host', _default_host),
             'port': primary.get('port', 9001),
             'raid_level': raid_level
         }
@@ -1141,7 +1162,7 @@ class AuthenticationServer:
         # For RAID 0: include all nodes for striping
         if raid_level == 'raid0':
             result['stripe_nodes'] = [
-                {'name': n['node_name'], 'host': n.get('host', '127.0.0.1'), 'port': n.get('port', 9001)}
+                {'name': n['node_name'], 'host': n.get('host', _default_host), 'port': n.get('port', 9001)}
                 for n in active_nodes
             ]
         else:
@@ -1677,8 +1698,13 @@ class AuthenticationServer:
                                                         resp_obj['is_striped'] = True
                                                 else:
                                                     # No storage nodes available - use default
-                                                    print(f"[AuthServer] No RAID storage available, using default 127.0.0.1:9003")
-                                                    resp_obj['storage_location'] = "127.0.0.1:9003"
+                                                    try:
+                                                        from network_config import DEFAULT_HOST
+                                                        _fallback_host = DEFAULT_HOST
+                                                    except ImportError:
+                                                        _fallback_host = '127.0.0.1'
+                                                    print(f"[AuthServer] No RAID storage available, using default {_fallback_host}:9003")
+                                                    resp_obj['storage_location'] = f"{_fallback_host}:9003"
                                                     resp_obj['storage_node'] = "ST1-A"
                                                     
                                             elif op_check == 'READ':
@@ -1772,8 +1798,13 @@ class AuthenticationServer:
 
                 elif action == 'register_node':
                     # Storage node registration (infrastructure action, no auth required)
+                    try:
+                        from network_config import DEFAULT_HOST
+                        _node_default_host = DEFAULT_HOST
+                    except ImportError:
+                        _node_default_host = '127.0.0.1'
                     node_name = req.get('node_name')
-                    host = req.get('host', '127.0.0.1')
+                    host = req.get('host', _node_default_host)
                     port = req.get('port')
                     raid_level = req.get('raid_level', 0)
                     
@@ -2509,11 +2540,21 @@ class AuthenticationServer:
                 for node in config['nodes']:
                     storage_nodes.append((node['host'], node['port'], node['name']))
         except ImportError:
-            # Fallback
-            storage_nodes = [
-                ('127.0.0.1', 9003, 'ST1-A'),
-                ('127.0.0.1', 9004, 'ST1-B'),
-            ]
+            # Fallback - use network_config if available
+            try:
+                from network_config import get_all_storage_addresses, DEFAULT_HOST
+                all_storage = get_all_storage_addresses()
+                storage_nodes = [(host, port, f'ST{i}') for i, (host, port, _) in enumerate(all_storage, 1)]
+                if not storage_nodes:
+                    storage_nodes = [
+                        (DEFAULT_HOST, 9003, 'ST1-A'),
+                        (DEFAULT_HOST, 9004, 'ST1-B'),
+                    ]
+            except ImportError:
+                storage_nodes = [
+                    ('127.0.0.1', 9003, 'ST1-A'),
+                    ('127.0.0.1', 9004, 'ST1-B'),
+                ]
         
         import socket
         for host, port, name in storage_nodes:
@@ -2543,8 +2584,13 @@ if __name__ == "__main__":
     import sys
     # CLI: python server.py S1  -> start AuthenticationServer
     if len(sys.argv) > 1 and sys.argv[1].upper().startswith('S'):
-        host = '127.0.0.1'
-        port = 7001
+        # Get host/port from network config
+        try:
+            from network_config import get_server_address
+            host, port = get_server_address()
+        except ImportError:
+            host, port = '127.0.0.1', 7001
+        
         srv = AuthenticationServer(host, port)
         try:
             srv.start()
@@ -2564,4 +2610,4 @@ if __name__ == "__main__":
             srv.stop()
             print("Authentication server stopped")
     else:
-        print("Usage: python server.py S1   # start AuthenticationServer on 127.0.0.1:7001")
+        print("Usage: python server.py S1   # start AuthenticationServer")

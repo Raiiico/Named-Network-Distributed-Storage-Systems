@@ -13,7 +13,18 @@ from parsing_module import ParsingModule
 from processing_module import ProcessingModule
 from routing_module import RoutingModule
 from common import ContentStore, InterestPacket, PendingInterestTable
-from fib_config import get_fib_config, get_port_for_router
+from fib_config import get_fib_config, get_port_for_router, get_host_for_router
+
+# Import network configuration
+try:
+    from network_config import (
+        get_default_router_address, get_server_address, get_all_storage_addresses,
+        STORAGE_CONFIG, DEFAULT_HOST
+    )
+    _USE_NETWORK_CONFIG = True
+except ImportError:
+    _USE_NETWORK_CONFIG = False
+    DEFAULT_HOST = '127.0.0.1'
 
 # Import GUI if available
 try:
@@ -25,11 +36,13 @@ except ImportError:
 
 
 class Router:
-    def __init__(self, router_id: str, host: str = "127.0.0.1", port: int = None, use_gui: bool = True):
+    def __init__(self, router_id: str, host: str = None, port: int = None, use_gui: bool = True):
         self.router_id = router_id
         self.node_name = f"Router-{router_id}"
         
-        # Auto-determine port based on router ID if not specified
+        # Auto-determine host and port based on router ID if not specified
+        if host is None:
+            host = get_host_for_router(router_id)
         if port is None:
             port = get_port_for_router(router_id)
         
@@ -77,12 +90,15 @@ class Router:
         self.pit = {}
         
         # Round-robin storage node selection (for R2)
-        self._storage_nodes = [
-            ('127.0.0.1', 9001, 0),  # ST1 - RAID 0
-            ('127.0.0.1', 9002, 1),  # ST2 - RAID 1
-            ('127.0.0.1', 9003, 5),  # ST3 - RAID 5
-            ('127.0.0.1', 9004, 6),  # ST4 - RAID 6
-        ]
+        if _USE_NETWORK_CONFIG:
+            self._storage_nodes = get_all_storage_addresses()
+        else:
+            self._storage_nodes = [
+                ('127.0.0.1', 9001, 0),  # ST1 - RAID 0
+                ('127.0.0.1', 9002, 1),  # ST2 - RAID 1
+                ('127.0.0.1', 9003, 5),  # ST3 - RAID 5
+                ('127.0.0.1', 9004, 6),  # ST4 - RAID 6
+            ]
         self._storage_index = 0
         self._storage_lock = threading.Lock()
         
@@ -90,6 +106,11 @@ class Router:
         # Format: {base_name: {stripe_set: {frag_index: raw_bytes}}}
         self._raid5_stripe_buffer = {}
         self._raid5_buffer_lock = threading.Lock()
+        
+        # Encryption key cache for RAID 5/6 parity encryption
+        # Format: {base_name: encryption_key_hex}
+        self._raid_encryption_keys = {}
+        self._raid_encryption_lock = threading.Lock()
         
         # Read token cache for R2 (multi-use tokens for fragment access)
         # Format: {token: {user_id, resource, expires_at, access_count}}
@@ -246,9 +267,17 @@ class Router:
         
         # Default routes (will be updated when nodes connect)
         # add_route(prefix, next_hop, interface, hop_count)
-        self.routing_module.add_route("/server", "127.0.0.1:7001", "eth0", 1)
-        self.routing_module.add_route("/storage", "127.0.0.1:9001", "eth0", 1)
-        self.routing_module.add_route("/admin", "127.0.0.1:7001", "eth0", 1)
+        if _USE_NETWORK_CONFIG:
+            server_host, server_port = get_server_address()
+            storage_nodes = get_all_storage_addresses()
+            default_storage = storage_nodes[0] if storage_nodes else (DEFAULT_HOST, 9001, 0)
+            self.routing_module.add_route("/server", f"{server_host}:{server_port}", "eth0", 1)
+            self.routing_module.add_route("/storage", f"{default_storage[0]}:{default_storage[1]}", "eth0", 1)
+            self.routing_module.add_route("/admin", f"{server_host}:{server_port}", "eth0", 1)
+        else:
+            self.routing_module.add_route("/server", "127.0.0.1:7001", "eth0", 1)
+            self.routing_module.add_route("/storage", "127.0.0.1:9001", "eth0", 1)
+            self.routing_module.add_route("/admin", "127.0.0.1:7001", "eth0", 1)
         
         self._log_control("=== Initial FIB Table ===")
         self.routing_module.show_fib()
@@ -723,10 +752,12 @@ class Router:
                         self._log_debug(f"📦 WRITE_DATA using client-provided storage: {storage_host}:{storage_port}", "data")
                     except Exception as e:
                         self._log_debug(f"Invalid target_storage format: {target_storage}, using default", "error")
-                        storage_host, storage_port = '127.0.0.1', 9001
+                        default_storage = self._storage_nodes[0] if self._storage_nodes else (DEFAULT_HOST, 9001, 0)
+                        storage_host, storage_port = default_storage[0], default_storage[1]
                 else:
                     # Fallback: Query server for file location (for updates to existing files)
-                    storage_host, storage_port = '127.0.0.1', 9001  # Default fallback
+                    default_storage = self._storage_nodes[0] if self._storage_nodes else (DEFAULT_HOST, 9001, 0)
+                    storage_host, storage_port = default_storage[0], default_storage[1]  # Default fallback
                     server_route = self.routing_module.lookup_route('/dlsu/server')
                     if server_route:
                         location_payload = {
@@ -744,7 +775,7 @@ class Router:
                                 # Server returns array directly, not {'locations': [...]}
                                 locations = loc_data if isinstance(loc_data, list) else loc_data.get('locations', [])
                                 if locations:
-                                    storage_host = locations[0].get('host', '127.0.0.1')
+                                    storage_host = locations[0].get('host', DEFAULT_HOST)
                                     storage_port = locations[0].get('port', 9001)
                                     self._log_debug(f"📦 WRITE_DATA to storage via server lookup: {storage_host}:{storage_port}", "data")
                             except Exception as e:
@@ -915,7 +946,17 @@ class Router:
                             print(f"[{self.router_id}] ★ RAID 5: Fragment {frag_idx}/{total_frags} → {target_node['name']} (stripe set {stripe_set}, parity on node {parity_node_idx})")
                             
                             # Store fragment in stripe buffer for consistent parity calculation
+                            # IMPORTANT: Unwrap the JSON payload to get raw bytes that match what storage stores
                             frag_bytes = write_payload.encode('utf-8') if isinstance(write_payload, str) else write_payload
+                            try:
+                                import base64 as _b64
+                                payload_str = frag_bytes.decode('utf-8') if isinstance(frag_bytes, bytes) else frag_bytes
+                                payload_dict = _json.loads(payload_str)
+                                if isinstance(payload_dict, dict) and 'data_b64' in payload_dict:
+                                    # Extract raw bytes from base64-encoded payload
+                                    frag_bytes = _b64.b64decode(payload_dict['data_b64'])
+                            except Exception:
+                                pass  # Keep original bytes if unwrapping fails
                             with self._raid5_buffer_lock:
                                 if base_name not in self._raid5_stripe_buffer:
                                     self._raid5_stripe_buffer[base_name] = {}
@@ -926,15 +967,35 @@ class Router:
                             # Send data fragment to target node
                             storage_resp = self.comm_module.send_and_wait(data_pkt.to_json(), target_node['host'], target_node['port'], timeout=10)
                             
+                            # Parse encryption key from storage response (format: STORED:filename:enc_key=KEY)
+                            if storage_resp:
+                                resp_str = storage_resp if isinstance(storage_resp, str) else storage_resp.decode('utf-8', errors='ignore')
+                                if ':enc_key=' in resp_str:
+                                    try:
+                                        import re as _re
+                                        enc_match = _re.search(r':enc_key=([a-fA-F0-9]+)', resp_str)
+                                        if enc_match:
+                                            enc_key = enc_match.group(1)
+                                            with self._raid_encryption_lock:
+                                                self._raid_encryption_keys[base_name] = enc_key
+                                            print(f"[{self.router_id}] RAID 5: Captured encryption key for {base_name}")
+                                    except Exception as e:
+                                        print(f"[{self.router_id}] RAID 5: Could not parse encryption key: {e}")
+                            
                             # Check if this is the last fragment in the stripe set - compute and store parity
                             is_last_in_stripe = (position_in_stripe == data_nodes - 1)
                             is_last_overall = (frag_idx == total_frags)
                             
                             if is_last_in_stripe or is_last_overall:
-                                # Compute parity for this stripe set using buffered raw data
+                                # Compute parity for this stripe set
+                                # IMPORTANT: Encrypt fragments before computing parity so parity matches stored encrypted data
                                 stripe_start = stripe_set * data_nodes + 1
                                 stripe_frags = []
                                 frag_sizes = {}  # Track individual fragment sizes for recovery
+                                
+                                # Get encryption key for this file
+                                with self._raid_encryption_lock:
+                                    enc_key = self._raid_encryption_keys.get(base_name)
                                 
                                 with self._raid5_buffer_lock:
                                     stripe_buffer = self._raid5_stripe_buffer.get(base_name, {}).get(stripe_set, {})
@@ -943,12 +1004,16 @@ class Router:
                                         if frag_num <= total_frags:
                                             if frag_num in stripe_buffer:
                                                 frag_data = stripe_buffer[frag_num]
+                                                # Encrypt fragment before adding to parity calculation
+                                                if enc_key:
+                                                    frag_data = self._xor_cipher(frag_data, enc_key)
                                                 stripe_frags.append(frag_data)
                                                 frag_sizes[frag_num] = len(frag_data)
                                             else:
                                                 print(f"[{self.router_id}] RAID 5: Warning - missing frag {frag_num} in buffer for parity calc")
                                 
                                 # Compute XOR parity if we have fragments for this stripe
+                                # Parity is computed on ENCRYPTED fragments so it can be used for recovery
                                 if len(stripe_frags) >= 1:
                                     parity_data = self._compute_xor_parity(stripe_frags)
                                     parity_node = raid_nodes[parity_node_idx]
@@ -963,7 +1028,7 @@ class Router:
                                         data_payload=parity_data
                                     )
                                     
-                                    print(f"[{self.router_id}] ★ RAID 5: Storing parity for stripe set {stripe_set} on {parity_node['name']} ({len(parity_data)} bytes, sizes: {frag_sizes})")
+                                    print(f"[{self.router_id}] ★ RAID 5: Storing encrypted parity for stripe set {stripe_set} on {parity_node['name']} ({len(parity_data)} bytes, sizes: {frag_sizes})")
                                     
                                     # Send parity to parity node
                                     parity_resp = self.comm_module.send_and_wait(parity_pkt.to_json(), parity_node['host'], parity_node['port'], timeout=10)
@@ -1041,7 +1106,17 @@ class Router:
                             print(f"[{self.router_id}] ★ RAID 6: Fragment {frag_idx}/{total_frags} → {target_node['name']} (stripe {stripe_set}, P→node{p_node_idx}, Q→node{q_node_idx})")
                             
                             # Store fragment in stripe buffer for parity calculation
+                            # IMPORTANT: Unwrap the JSON payload to get raw bytes that match what storage stores
                             frag_bytes = write_payload.encode('utf-8') if isinstance(write_payload, str) else write_payload
+                            try:
+                                import base64 as _b64
+                                payload_str = frag_bytes.decode('utf-8') if isinstance(frag_bytes, bytes) else frag_bytes
+                                payload_dict = _json.loads(payload_str)
+                                if isinstance(payload_dict, dict) and 'data_b64' in payload_dict:
+                                    # Extract raw bytes from base64-encoded payload
+                                    frag_bytes = _b64.b64decode(payload_dict['data_b64'])
+                            except Exception:
+                                pass  # Keep original bytes if unwrapping fails
                             with self._raid5_buffer_lock:  # Reuse RAID 5 buffer
                                 buffer_key = f"raid6_{base_name}"
                                 if buffer_key not in self._raid5_stripe_buffer:
@@ -1053,15 +1128,35 @@ class Router:
                             # Send data fragment to target node
                             storage_resp = self.comm_module.send_and_wait(data_pkt.to_json(), target_node['host'], target_node['port'], timeout=10)
                             
+                            # Parse encryption key from storage response (format: STORED:filename:enc_key=KEY)
+                            if storage_resp:
+                                resp_str = storage_resp if isinstance(storage_resp, str) else storage_resp.decode('utf-8', errors='ignore')
+                                if ':enc_key=' in resp_str:
+                                    try:
+                                        import re as _re
+                                        enc_match = _re.search(r':enc_key=([a-fA-F0-9]+)', resp_str)
+                                        if enc_match:
+                                            enc_key = enc_match.group(1)
+                                            with self._raid_encryption_lock:
+                                                self._raid_encryption_keys[base_name] = enc_key
+                                            print(f"[{self.router_id}] RAID 6: Captured encryption key for {base_name}")
+                                    except Exception as e:
+                                        print(f"[{self.router_id}] RAID 6: Could not parse encryption key: {e}")
+                            
                             # Check if this is the last fragment in the stripe set - compute and store both parities
                             is_last_in_stripe = (position_in_stripe == data_nodes_per_stripe - 1)
                             is_last_overall = (frag_idx == total_frags)
                             
                             if is_last_in_stripe or is_last_overall:
                                 # Compute P and Q parity for this stripe set
+                                # IMPORTANT: Encrypt fragments before computing parity so parity matches stored encrypted data
                                 stripe_start = stripe_set * data_nodes_per_stripe + 1
                                 stripe_frags = []
                                 frag_sizes = {}
+                                
+                                # Get encryption key for this file
+                                with self._raid_encryption_lock:
+                                    enc_key = self._raid_encryption_keys.get(base_name)
                                 
                                 with self._raid5_buffer_lock:
                                     buffer_key = f"raid6_{base_name}"
@@ -1071,11 +1166,14 @@ class Router:
                                         if frag_num <= total_frags:
                                             if frag_num in stripe_buffer:
                                                 frag_data = stripe_buffer[frag_num]
+                                                # Encrypt fragment before adding to parity calculation
+                                                if enc_key:
+                                                    frag_data = self._xor_cipher(frag_data, enc_key)
                                                 stripe_frags.append(frag_data)
                                                 frag_sizes[frag_num] = len(frag_data)
                                 
                                 if len(stripe_frags) >= 1:
-                                    # Compute P parity (XOR)
+                                    # Compute P parity (XOR) on ENCRYPTED fragments
                                     p_parity = self._compute_xor_parity(stripe_frags)
                                     
                                     # Compute Q parity (weighted XOR for Reed-Solomon-like behavior)
@@ -1089,14 +1187,14 @@ class Router:
                                     p_name = f"{base_name}:parity_p[{stripe_set}]:sizes[{sizes_str}]"
                                     p_pkt = DataPacket(name=p_name, data_payload=p_parity)
                                     
-                                    print(f"[{self.router_id}] ★ RAID 6: Storing P parity for stripe {stripe_set} on {p_node['name']} ({len(p_parity)} bytes)")
+                                    print(f"[{self.router_id}] ★ RAID 6: Storing encrypted P parity for stripe {stripe_set} on {p_node['name']} ({len(p_parity)} bytes)")
                                     self.comm_module.send_and_wait(p_pkt.to_json(), p_node['host'], p_node['port'], timeout=10)
                                     
                                     # Store Q parity
                                     q_name = f"{base_name}:parity_q[{stripe_set}]:sizes[{sizes_str}]"
                                     q_pkt = DataPacket(name=q_name, data_payload=q_parity)
                                     
-                                    print(f"[{self.router_id}] ★ RAID 6: Storing Q parity for stripe {stripe_set} on {q_node['name']} ({len(q_parity)} bytes)")
+                                    print(f"[{self.router_id}] ★ RAID 6: Storing encrypted Q parity for stripe {stripe_set} on {q_node['name']} ({len(q_parity)} bytes)")
                                     self.comm_module.send_and_wait(q_pkt.to_json(), q_node['host'], q_node['port'], timeout=10)
                                     
                                     print(f"[{self.router_id}] ✓ RAID 6: Both parities stored for stripe {stripe_set}")
@@ -1387,7 +1485,7 @@ class Router:
                                         elif storage_locs:
                                             # Non-RAID file: use storage locations from DB
                                             for loc in storage_locs:
-                                                loc_host = loc.get('host', '127.0.0.1')
+                                                loc_host = loc.get('host', DEFAULT_HOST)
                                                 loc_port = loc.get('port', 9001)
                                                 try:
                                                     storage_resp = self._forward_to_next_hop(interest, f"{loc_host}:{loc_port}")
@@ -1753,8 +1851,20 @@ class Router:
                         print(f"[{self.router_id}]   ✗ Failed to parse parity: {e}")
                 
                 # Recover using XOR
-                if len(recovery_data) >= data_nodes:  # Need other data + parity
-                    recovered = self._compute_xor_parity(recovery_data)
+                # Check if this is the last fragment in an incomplete stripe
+                # (e.g., fragment 61 of 61 with 2 data nodes per stripe - it's the only fragment in its stripe)
+                frags_in_this_stripe = min(data_nodes, total_frags - (stripe_set * data_nodes))
+                is_incomplete_stripe = (len(recovery_data) == 1 and frags_in_this_stripe == 1)
+                
+                if len(recovery_data) >= data_nodes or is_incomplete_stripe:
+                    # For incomplete last stripe with only parity, parity IS the data
+                    # (since XOR of single fragment = parity)
+                    if is_incomplete_stripe and len(recovery_data) == 1:
+                        # recovery_data[0] is the parity, which equals the single fragment
+                        recovered = recovery_data[0]
+                        print(f"[{self.router_id}] ✓ RAID 5 RECOVERY: Last fragment in incomplete stripe - parity = data")
+                    else:
+                        recovered = self._compute_xor_parity(recovery_data)
                     
                     # Determine correct fragment size using stored metadata
                     # The parity response includes the original sizes of all fragments in the stripe
@@ -2037,10 +2147,18 @@ class Router:
                     except Exception as e:
                         print(f"[{self.router_id}]   ✗ Failed to get Q parity: {e}")
                 
+                # Check if this is the last fragment in an incomplete stripe
+                frags_in_this_stripe = min(data_nodes_per_stripe, total_frags - (stripe_set * data_nodes_per_stripe))
+                is_incomplete_stripe = (len(recovery_data) == 0 and frags_in_this_stripe == 1)
+                
                 # Recover using available parities
-                if len(recovery_data) >= 1 and (p_data or q_data):
-                    # Use P parity first (simpler XOR recovery), fall back to Q
-                    if p_data:
+                if (len(recovery_data) >= 1 and (p_data or q_data)) or (is_incomplete_stripe and p_data):
+                    # For incomplete last stripe with only 1 fragment, P parity IS the data
+                    if is_incomplete_stripe and p_data:
+                        recovered = p_data
+                        print(f"[{self.router_id}] ✓ RAID 6 RECOVERY: Last fragment in incomplete stripe - P parity = data")
+                    elif p_data:
+                        # Use P parity first (simpler XOR recovery), fall back to Q
                         recovery_data.append(p_data)
                         recovered = self._compute_xor_parity(recovery_data)
                         print(f"[{self.router_id}] ✓ RAID 6 RECOVERY: Used P parity")
@@ -2489,6 +2607,32 @@ class Router:
                 q_parity[i] ^= rotated
         
         return bytes(q_parity)
+    
+    def _xor_cipher(self, data: bytes, key_hex: str) -> bytes:
+        """XOR cipher for encrypting/decrypting data with a hex-encoded key.
+        
+        Used for encrypting parity blocks in RAID 5/6 to match encrypted fragments.
+        XOR is symmetric - same function for encrypt and decrypt.
+        
+        Args:
+            data: Data bytes to encrypt/decrypt
+            key_hex: Hex-encoded encryption key
+            
+        Returns:
+            XOR-encrypted/decrypted bytes
+        """
+        if not key_hex:
+            return data
+        try:
+            key = bytes.fromhex(key_hex)
+            result = bytearray(len(data))
+            key_len = len(key)
+            for i, byte in enumerate(data):
+                result[i] = byte ^ key[i % key_len]
+            return bytes(result)
+        except Exception as e:
+            print(f"[{self.router_id}] XOR cipher error: {e}")
+            return data
     
     def _recover_with_pq(self, p_data: bytes, q_data: bytes, known_block: bytes, 
                           known_idx: int, missing_idx: int, num_blocks: int) -> bytes:

@@ -15,46 +15,66 @@ RAID Group Port Allocation:
 - RAID 1 (Mirroring): ST1-A (9003), ST1-B (9004)
 - RAID 5 (Single Parity): ST5-A (9005), ST5-B (9006), ST5-C (9007)
 - RAID 6 (Double Parity): ST6-A (9008), ST6-B (9009), ST6-C (9010), ST6-D (9011)
+
+NOTE: IP addresses are now configured in network_config.py
+      Edit network_config.json to change IPs for VM deployment.
 """
 
+# Import network configuration
+try:
+    from network_config import (
+        ROUTER_CONFIG, SERVER_CONFIG, CLIENT_CONFIG,
+        STORAGE_RAID0, STORAGE_RAID1, STORAGE_RAID5, STORAGE_RAID6,
+        generate_raid_groups, generate_fib_r1, generate_fib_r2,
+        get_router, get_server
+    )
+    _USE_NETWORK_CONFIG = True
+except ImportError:
+    _USE_NETWORK_CONFIG = False
+    print("[fib_config] Warning: network_config.py not found, using hardcoded defaults")
+
 # RAID Group Configuration - used by server for storage assignment
-RAID_GROUPS = {
-    'raid0': {
-        'level': 'raid0',
-        'min_nodes': 2,
-        'nodes': [
-            {'name': 'ST0-A', 'host': '127.0.0.1', 'port': 9001},
-            {'name': 'ST0-B', 'host': '127.0.0.1', 'port': 9002},
-        ]
-    },
-    'raid1': {
-        'level': 'raid1',
-        'min_nodes': 2,
-        'nodes': [
-            {'name': 'ST1-A', 'host': '127.0.0.1', 'port': 9003},
-            {'name': 'ST1-B', 'host': '127.0.0.1', 'port': 9004},
-        ]
-    },
-    'raid5': {
-        'level': 'raid5',
-        'min_nodes': 3,
-        'nodes': [
-            {'name': 'ST5-A', 'host': '127.0.0.1', 'port': 9005},
-            {'name': 'ST5-B', 'host': '127.0.0.1', 'port': 9006},
-            {'name': 'ST5-C', 'host': '127.0.0.1', 'port': 9007},
-        ]
-    },
-    'raid6': {
-        'level': 'raid6',
-        'min_nodes': 4,
-        'nodes': [
-            {'name': 'ST6-A', 'host': '127.0.0.1', 'port': 9008},
-            {'name': 'ST6-B', 'host': '127.0.0.1', 'port': 9009},
-            {'name': 'ST6-C', 'host': '127.0.0.1', 'port': 9010},
-            {'name': 'ST6-D', 'host': '127.0.0.1', 'port': 9011},
-        ]
+if _USE_NETWORK_CONFIG:
+    RAID_GROUPS = generate_raid_groups()
+else:
+    # Fallback to hardcoded config
+    RAID_GROUPS = {
+        'raid0': {
+            'level': 'raid0',
+            'min_nodes': 2,
+            'nodes': [
+                {'name': 'ST0-A', 'host': '127.0.0.1', 'port': 9001},
+                {'name': 'ST0-B', 'host': '127.0.0.1', 'port': 9002},
+            ]
+        },
+        'raid1': {
+            'level': 'raid1',
+            'min_nodes': 2,
+            'nodes': [
+                {'name': 'ST1-A', 'host': '127.0.0.1', 'port': 9003},
+                {'name': 'ST1-B', 'host': '127.0.0.1', 'port': 9004},
+            ]
+        },
+        'raid5': {
+            'level': 'raid5',
+            'min_nodes': 3,
+            'nodes': [
+                {'name': 'ST5-A', 'host': '127.0.0.1', 'port': 9005},
+                {'name': 'ST5-B', 'host': '127.0.0.1', 'port': 9006},
+                {'name': 'ST5-C', 'host': '127.0.0.1', 'port': 9007},
+            ]
+        },
+        'raid6': {
+            'level': 'raid6',
+            'min_nodes': 4,
+            'nodes': [
+                {'name': 'ST6-A', 'host': '127.0.0.1', 'port': 9008},
+                {'name': 'ST6-B', 'host': '127.0.0.1', 'port': 9009},
+                {'name': 'ST6-C', 'host': '127.0.0.1', 'port': 9010},
+                {'name': 'ST6-D', 'host': '127.0.0.1', 'port': 9011},
+            ]
+        }
     }
-}
 
 # Default RAID level when user doesn't specify
 DEFAULT_RAID_LEVEL = 'raid1'
@@ -75,6 +95,15 @@ def get_fib_config(router_name: str):
     /dlsu/server
     """
     
+    # Use network_config if available
+    if _USE_NETWORK_CONFIG:
+        if router_name == "R1":
+            return generate_fib_r1()
+        elif router_name == "R2":
+            return generate_fib_r2()
+        return []
+    
+    # Fallback to hardcoded config
     configs = {
         "R1": [
             # Router1 FIB - Edge router connecting clients (Alice/Bob) and R2
@@ -137,11 +166,24 @@ def get_fib_config(router_name: str):
 
 def get_port_for_router(router_name: str):
     """Get the port number for a router"""
+    if _USE_NETWORK_CONFIG:
+        router = get_router(router_name)
+        return router.get('port', 8001)
+    
+    # Fallback
     ports = {
         "R1": 8001,
         "R2": 8002
     }
     return ports.get(router_name, 8001)
+
+
+def get_host_for_router(router_name: str):
+    """Get the host IP for a router"""
+    if _USE_NETWORK_CONFIG:
+        router = get_router(router_name)
+        return router.get('host', '127.0.0.1')
+    return '127.0.0.1'
 
 
 def get_router_role(router_name: str):

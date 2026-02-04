@@ -41,3 +41,9 @@ storage_ST6-A_raid6/
 storage_ST6-B_raid6/
 storage_ST6-C_raid6/
 storage_ST6-D_raid6/
+generated_test_files/
+test_results/
+test_overhaul.py
+named_networks.db
+named_networks.db-shm
+named_networks.db-wal

@@ -10,6 +10,32 @@ import os
 from common import create_interest_packet, DataPacket, calculate_checksum, get_optimal_fragment_size
 from communication_module import CommunicationModule
 
+# Import network configuration
+try:
+    from network_config import (
+        get_default_router_address, get_server_address, get_all_storage_addresses,
+        DEFAULT_HOST
+    )
+    _USE_NETWORK_CONFIG = True
+except ImportError:
+    _USE_NETWORK_CONFIG = False
+    DEFAULT_HOST = '127.0.0.1'
+
+# Get default router address
+if _USE_NETWORK_CONFIG:
+    _DEFAULT_ROUTER_HOST, _DEFAULT_ROUTER_PORT = get_default_router_address()
+    _DEFAULT_SERVER_HOST, _DEFAULT_SERVER_PORT = get_server_address()
+    _DEFAULT_STORAGE_NODES = get_all_storage_addresses()
+else:
+    _DEFAULT_ROUTER_HOST, _DEFAULT_ROUTER_PORT = DEFAULT_HOST, 8001
+    _DEFAULT_SERVER_HOST, _DEFAULT_SERVER_PORT = DEFAULT_HOST, 7001
+    _DEFAULT_STORAGE_NODES = [
+        (DEFAULT_HOST, 9001, 0),
+        (DEFAULT_HOST, 9002, 1),
+        (DEFAULT_HOST, 9003, 5),
+        (DEFAULT_HOST, 9004, 6),
+    ]
+
 class SimpleClient:
     """Simple client for testing with fixed UDP communication"""
     
@@ -42,11 +68,16 @@ class SimpleClient:
         print(f"[{self.node_name}] Client initialized (UDP)")
     
     def send_interest(self, content_name: str, operation: str = "READ", 
-                     router_host: str = "127.0.0.1", router_port: int = 8001, auth_key: str = None,
+                     router_host: str = None, router_port: int = None, auth_key: str = None,
                      max_retries: int = 3, timeout: float = 5.0, target: str = None):
         """Send Interest packet to router with retry and timeout
         Returns DataPacket on success or None on failure
         """
+        # Use network config defaults if not specified
+        if router_host is None:
+            router_host = _DEFAULT_ROUTER_HOST
+        if router_port is None:
+            router_port = _DEFAULT_ROUTER_PORT
         
         # Create Interest packet with proper checksum
         # If this is an auth check with a distinct target, create an auth Interest
@@ -144,8 +175,12 @@ class SimpleClient:
             print(f"\nError parsing response: {e}")
             return None
     
-    def run_test_scenarios(self, router_host: str = "127.0.0.1", router_port: int = 8001):
+    def run_test_scenarios(self, router_host: str = None, router_port: int = None):
         """Run test scenarios"""
+        if router_host is None:
+            router_host = _DEFAULT_ROUTER_HOST
+        if router_port is None:
+            router_port = _DEFAULT_ROUTER_PORT
         print(f"\n{'#'*70}")
         print(f"# {self.node_name} - TEST SCENARIOS (UDP)")
         print(f"{'#'*70}\n")
@@ -175,8 +210,12 @@ class SimpleClient:
         
         self._show_statistics()
     
-    def concurrent_test(self, router_host: str = "127.0.0.1", router_port: int = 8001):
+    def concurrent_test(self, router_host: str = None, router_port: int = None):
         """Test concurrent request handling"""
+        if router_host is None:
+            router_host = _DEFAULT_ROUTER_HOST
+        if router_port is None:
+            router_port = _DEFAULT_ROUTER_PORT
         import threading
         
         print(f"\n{'='*70}")
@@ -229,8 +268,12 @@ class SimpleClient:
         print(f"  Protocol:        UDP")
         print(f"{'='*70}\n")
     
-    def interactive_mode(self, router_host: str = "127.0.0.1", router_port: int = 8001):
+    def interactive_mode(self, router_host: str = None, router_port: int = None):
         """Interactive mode"""
+        if router_host is None:
+            router_host = _DEFAULT_ROUTER_HOST
+        if router_port is None:
+            router_port = _DEFAULT_ROUTER_PORT
         print(f"\n{'='*70}")
         print(f"INTERACTIVE MODE - {self.node_name} (UDP)")
         print(f"{'='*70}")
@@ -391,11 +434,15 @@ class SimpleClient:
             except Exception as e:
                 print(f"Error: {e}")
     
-    def _grant_permission(self, file_name: str, target_user: str, perm_level: str = 'READ', router_host: str = '127.0.0.1', router_port: int = 8001):
+    def _grant_permission(self, file_name: str, target_user: str, perm_level: str = 'READ', router_host: str = None, router_port: int = None):
         """Grant permission to another user on your file via router (NDN Interest)
         perm_level: 'READ' for read-only, 'WRITE' for read+write
         Name format: /dlsu/server/permission/grant:<perm>:<resource>:<target>
         Password is sent as auth_key in Interest"""
+        if router_host is None:
+            router_host = _DEFAULT_ROUTER_HOST
+        if router_port is None:
+            router_port = _DEFAULT_ROUTER_PORT
         name = f"/dlsu/server/permission/grant:{perm_level}:{file_name}:{target_user}"
         resp = self.send_interest(name, operation='PERMISSION', router_host=router_host, router_port=router_port, auth_key=self.password)
         if resp:
@@ -407,11 +454,15 @@ class SimpleClient:
         else:
             print("✗ No response from router/server")
 
-    def _revoke_permission(self, file_name: str, target_user: str, revoke_write_only: bool = False, router_host: str = '127.0.0.1', router_port: int = 8001):
+    def _revoke_permission(self, file_name: str, target_user: str, revoke_write_only: bool = False, router_host: str = None, router_port: int = None):
         """Revoke permission via router
         revoke_write_only: if True, only revokes WRITE (keeps READ); if False, revokes all
         Name format: /dlsu/server/permission/revoke:<mode>:<resource>:<target>
         """
+        if router_host is None:
+            router_host = _DEFAULT_ROUTER_HOST
+        if router_port is None:
+            router_port = _DEFAULT_ROUTER_PORT
         mode = 'WRITE' if revoke_write_only else 'ALL'
         name = f"/dlsu/server/permission/revoke:{mode}:{file_name}:{target_user}"
         resp = self.send_interest(name, operation='PERMISSION', router_host=router_host, router_port=router_port, auth_key=self.password)
@@ -424,8 +475,12 @@ class SimpleClient:
         else:
             print("✗ No response from router/server")
 
-    def _list_my_files(self, router_host: str = '127.0.0.1', router_port: int = 8001):
+    def _list_my_files(self, router_host: str = None, router_port: int = None):
         """List files owned by this user via router (Interest: /dlsu/server/myfiles)"""
+        if router_host is None:
+            router_host = _DEFAULT_ROUTER_HOST
+        if router_port is None:
+            router_port = _DEFAULT_ROUTER_PORT
         name = "/dlsu/server/myfiles"
         # Use LIST operation so server treats this as an Interest LIST request
         resp = self.send_interest(name, operation='LIST', router_host=router_host, router_port=router_port, auth_key=self.password)
@@ -435,17 +490,47 @@ class SimpleClient:
                 print(f"\n{'='*70}")
                 print(f"MY FILES ({self.client_id})")
                 print(f"{'='*70}")
-                print(payload)
+                
+                # Parse JSON and format nicely
+                import json
+                try:
+                    data = json.loads(payload)
+                    if 'error' in data:
+                        print(f"  Error: {data['error']}")
+                    elif 'files' in data:
+                        files = data['files']
+                        if not files:
+                            print("  No files found.")
+                        else:
+                            print(f"  {'File Name':<45} {'Permission':<12} {'Owner'}")
+                            print(f"  {'-'*45} {'-'*12} {'-'*15}")
+                            for f in files:
+                                fname = f.get('name', 'Unknown')
+                                perm = f.get('permission', '-')
+                                owner = f.get('owner', '-')
+                                print(f"  {fname:<45} {perm:<12} {owner}")
+                            print(f"\n  Total: {len(files)} file(s)")
+                    else:
+                        # Raw output fallback
+                        print(payload)
+                except json.JSONDecodeError:
+                    # Not JSON, print as-is
+                    print(payload)
+                
                 print(f"{'='*70}\n")
             except Exception:
                 print("Could not parse server response")
         else:
             print("✗ No response from router/server")
 
-    def _list_file_locations(self, file_name: str, router_host: str = '127.0.0.1', router_port: int = 8001):
+    def _list_file_locations(self, file_name: str, router_host: str = None, router_port: int = None):
         """Query server via router for storage node locations for a file.
         Uses Interest: /dlsu/server/locations:<resource>
         """
+        if router_host is None:
+            router_host = _DEFAULT_ROUTER_HOST
+        if router_port is None:
+            router_port = _DEFAULT_ROUTER_PORT
         name = f"/dlsu/server/locations:{file_name}"
         resp = self.send_interest(name, operation='PERMISSION', router_host=router_host, router_port=router_port, auth_key=self.password)
         if resp:
@@ -488,17 +573,16 @@ class SimpleClient:
         
         print(f"{'='*70}\n")
 
-    def _get_storage_stats(self, router_host: str = '127.0.0.1', router_port: int = 8001):
+    def _get_storage_stats(self, router_host: str = None, router_port: int = None):
         """Query all storage nodes for RAID statistics"""
+        if router_host is None:
+            router_host = _DEFAULT_ROUTER_HOST
+        if router_port is None:
+            router_port = _DEFAULT_ROUTER_PORT
         import json
         
-        # Known storage nodes (matching router's _storage_nodes)
-        storage_nodes = [
-            ('ST1', '127.0.0.1', 9001, 0),
-            ('ST2', '127.0.0.1', 9002, 1),
-            ('ST3', '127.0.0.1', 9003, 5),
-            ('ST4', '127.0.0.1', 9004, 6),
-        ]
+        # Known storage nodes - use network config if available
+        storage_nodes = [(f'ST{i}', host, port, raid) for i, (host, port, raid) in enumerate(_DEFAULT_STORAGE_NODES, 1)]
         
         print(f"\n{'='*80}")
         print(f"STORAGE NODE STATISTICS")
@@ -560,8 +644,12 @@ class SimpleClient:
         print(f"TOTALS: {total_files} files, {total_fragments} fragments, {total_parity} parity blocks, {total_size/1024:.2f} KB")
         print(f"{'='*80}\n")
     
-    def _clear_system(self, router_host: str = '127.0.0.1', router_port: int = 8001):
+    def _clear_system(self, router_host: str = None, router_port: int = None):
         """Clear all files from the system (server DB and storage nodes)"""
+        if router_host is None:
+            router_host = _DEFAULT_ROUTER_HOST
+        if router_port is None:
+            router_port = _DEFAULT_ROUTER_PORT
         import json
         
         print(f"\n{'='*80}")
@@ -580,7 +668,7 @@ class SimpleClient:
                 auth_key=self.password
             )
             
-            resp = self.comm_module.send_packet_sync('127.0.0.1', 7001, clear_interest.to_json())
+            resp = self.comm_module.send_packet_sync(_DEFAULT_SERVER_HOST, _DEFAULT_SERVER_PORT, clear_interest.to_json())
             
             if resp:
                 try:
@@ -638,10 +726,14 @@ class SimpleClient:
         print("✓ System clear complete. Users and credentials retained.")
         print(f"{'='*80}\n")
 
-    def _cleanup_missing_file(self, resource_name: str, server_host: str = '127.0.0.1', server_port: int = 7001):
+    def _cleanup_missing_file(self, resource_name: str, server_host: str = None, server_port: int = None):
         """Attempt to delete a file from the server DB when storage reports it's not found.
         This keeps the DB in sync with actual storage.
         """
+        if server_host is None:
+            server_host = _DEFAULT_SERVER_HOST
+        if server_port is None:
+            server_port = _DEFAULT_SERVER_PORT
         try:
             import json
             # Normalize the resource name
@@ -675,12 +767,16 @@ class SimpleClient:
             # Silently fail cleanup - it's not critical
             pass
 
-    def _check_permission(self, resource: str, operation: str = 'READ', server_host: str = '127.0.0.1', server_port: int = 8001, password: str = None):
+    def _check_permission(self, resource: str, operation: str = 'READ', server_host: str = None, server_port: int = None, password: str = None):
         """Ask AuthenticationServer for permission using an Interest.
         
         Returns a dict with 'authorized' (bool) and optionally 'assigned_storage', 'storage_node', etc.
         For backwards compatibility, also supports bool-like truthiness check.
         """
+        if server_host is None:
+            server_host = _DEFAULT_ROUTER_HOST
+        if server_port is None:
+            server_port = _DEFAULT_ROUTER_PORT
         # Build auth Interest routed to server: use fixed name and include target payload
         auth_name = '/dlsu/server/auth'
 
@@ -741,8 +837,12 @@ class SimpleClient:
         # The router will forward to the appropriate storage node based on FIB
         return self.download_file(content_name, dest_path=None, host=router_host, port=router_port, read_token=read_token)
 
-    def _do_delete(self, content_name: str, router_host: str = '127.0.0.1', router_port: int = 8001, password: str = None):
+    def _do_delete(self, content_name: str, router_host: str = None, router_port: int = None, password: str = None):
         """Perform authenticated DELETE: check ownership, then send DELETE Interest to storage via router."""
+        if router_host is None:
+            router_host = _DEFAULT_ROUTER_HOST
+        if router_port is None:
+            router_port = _DEFAULT_ROUTER_PORT
         # Normalize name to storage namespace
         if content_name:
             if '/' not in content_name:
@@ -782,12 +882,20 @@ class SimpleClient:
             print("✗ No response from router (timeout)")
             return False
 
-    def _do_write(self, local_path: str, dest_name: str, storage_host: str = '127.0.0.1', storage_port: int = 9001, password: str = None, raid_preference: str = None, router_host: str = '127.0.0.1', router_port: int = 8001):
+    def _do_write(self, local_path: str, dest_name: str, storage_host: str = None, storage_port: int = None, password: str = None, raid_preference: str = None, router_host: str = None, router_port: int = None):
         """Perform authenticated WRITE: check permission via router, then upload file through router.
         
         All communication goes through the router (FIB topology) - client never contacts storage directly.
         The router will forward write data to the assigned storage node.
         """
+        if router_host is None:
+            router_host = _DEFAULT_ROUTER_HOST
+        if router_port is None:
+            router_port = _DEFAULT_ROUTER_PORT
+        if storage_host is None:
+            storage_host = _DEFAULT_STORAGE_NODES[0][0] if _DEFAULT_STORAGE_NODES else DEFAULT_HOST
+        if storage_port is None:
+            storage_port = _DEFAULT_STORAGE_NODES[0][1] if _DEFAULT_STORAGE_NODES else 9001
         print(f"[DEBUG] _do_write called: dest_name={dest_name}, raid_preference={raid_preference}")
         
         if not os.path.exists(local_path):
@@ -927,12 +1035,16 @@ class SimpleClient:
         return True
 
 
-    def upload_file(self, local_path: str, dest_name: str, host: str = "127.0.0.1", port: int = 9001):
+    def upload_file(self, local_path: str, dest_name: str, host: str = None, port: int = None):
         """DEPRECATED: Use _do_write() instead which routes through the router.
         
         This method sends directly to storage, bypassing FIB topology.
         Kept for backward compatibility but should not be used in normal operation.
         """
+        if host is None:
+            host = _DEFAULT_STORAGE_NODES[0][0] if _DEFAULT_STORAGE_NODES else DEFAULT_HOST
+        if port is None:
+            port = _DEFAULT_STORAGE_NODES[0][1] if _DEFAULT_STORAGE_NODES else 9001
         import os
         import json, base64
         from common import DataPacket
@@ -1007,7 +1119,7 @@ class SimpleClient:
             print(f"Error uploading file: {e}")
             return False
 
-    def download_file(self, content_name: str, dest_path: str = None, host: str = "127.0.0.1", port: int = 8001, read_token: str = None):
+    def download_file(self, content_name: str, dest_path: str = None, host: str = None, port: int = None, read_token: str = None):
         """Download named content (READ) from the router/storage and save to disk.
 
         `content_name` is the logical name (e.g. `/dlsu/uploads/foo.zip`).
@@ -1017,6 +1129,10 @@ class SimpleClient:
         `read_token` is an optional multi-use token for fragment access that avoids
         per-fragment permission checks.
         """
+        if host is None:
+            host = _DEFAULT_ROUTER_HOST
+        if port is None:
+            port = _DEFAULT_ROUTER_PORT
         from common import create_interest_packet, DataPacket, parse_fragment_notation
 
         # Default landing directory for downloads
@@ -1154,7 +1270,7 @@ def main():
     req = json.dumps(payload)
     
     try:
-        resp = client.comm_module.send_packet_sync('127.0.0.1', 7001, req)
+        resp = client.comm_module.send_packet_sync(_DEFAULT_SERVER_HOST, _DEFAULT_SERVER_PORT, req)
         if resp:
             # send_packet_sync already returns a decoded string
             if 'AUTHORIZED' in resp or 'SUCCESS' in resp.upper():
@@ -1171,8 +1287,8 @@ def main():
         print(f"✗ Authentication error: {e}")
         sys.exit(1)
     
-    router_host = "127.0.0.1"
-    router_port = 8001
+    router_host = _DEFAULT_ROUTER_HOST
+    router_port = _DEFAULT_ROUTER_PORT
     
     print(f"\nClient ID:     {client_id}")
     print(f"Target Router: {router_host}:{router_port}")

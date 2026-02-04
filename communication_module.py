@@ -11,15 +11,22 @@ import queue
 import time
 from typing import Callable, Optional
 
+# Import network config for default host
+try:
+    from network_config import DEFAULT_HOST
+    _DEFAULT_HOST = DEFAULT_HOST
+except ImportError:
+    _DEFAULT_HOST = "127.0.0.1"
+
 class CommunicationModule:
     """
     Communication Module implementing UDP producer-consumer architecture
     Full clean replacement
     """
 
-    def __init__(self, node_name: str, host: str = "127.0.0.1", port: int = 0):
+    def __init__(self, node_name: str, host: str = None, port: int = 0):
         self.node_name = node_name
-        self.host = host
+        self.host = host if host is not None else _DEFAULT_HOST
         self.port = port
         self.running = False
 

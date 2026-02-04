@@ -19,21 +19,36 @@ from common import InterestPacket, DataPacket, calculate_checksum
 from storage_module import StorageModule
 import fib_config  # topology config (default gateway ports)
 
+# Import network configuration
+try:
+    from network_config import get_server_address, get_router_address, DEFAULT_HOST
+    _USE_NETWORK_CONFIG = True
+except ImportError:
+    _USE_NETWORK_CONFIG = False
+    DEFAULT_HOST = '127.0.0.1'
+
 class SimpleStorageNode:
     """
     Simple Storage Node for demonstrating hub-and-spoke topology
     Stores files and responds to Interest packets
     """
     
-    def __init__(self, node_id: str, raid_level: int, host: str = "127.0.0.1", port: int = 9001, gateway_host: Optional[str] = None, gateway_port: Optional[int] = None):
+    def __init__(self, node_id: str, raid_level: int, host: str = None, port: int = 9001, gateway_host: Optional[str] = None, gateway_port: Optional[int] = None):
         self.node_id = node_id
         self.raid_level = raid_level
         self.node_name = f"Storage-{node_id}"
-        self.host = host
+        self.host = host if host is not None else DEFAULT_HOST
         self.port = port
 
         # Determine default gateway (router) for storage nodes: default to R2 port from fib_config
-        self.gateway_host = gateway_host or '127.0.0.1'
+        if gateway_host is None:
+            if _USE_NETWORK_CONFIG:
+                router_host, _ = get_router_address('R2')
+                self.gateway_host = router_host
+            else:
+                self.gateway_host = DEFAULT_HOST
+        else:
+            self.gateway_host = gateway_host
         self.gateway_port = gateway_port or fib_config.get_port_for_router('R2')
         
         # RAID peer configuration from fib_config
@@ -66,6 +81,9 @@ class SimpleStorageNode:
         # Fragment accumulator: base_name -> { index: bytes }
         self.fragment_accumulator = {}
         self._fragment_lock = threading.Lock()
+        # Encryption key tracker: base_name -> key_hex (generated on first fragment)
+        self.encryption_keys = {}
+        self._encryption_lock = threading.Lock()
         
         # Statistics
         self.stats = {
@@ -295,13 +313,29 @@ class SimpleStorageNode:
                 if self.raid_level == 0 or '/raid0/' in base_name:
                     print(f"[{self.node_name}] RAID 0: Storing fragment {index}/{total} immediately")
                     
-                    # Use dedicated RAID 0 single-fragment storage method
-                    storage_resp = self.storage_module.store_raid0_fragment(base_name, index, total, content_bytes)
+                    # Get or generate encryption key for this file
+                    with self._encryption_lock:
+                        enc_key = self.encryption_keys.get(base_name)
+                        # If no key yet, storage_module will generate one
+                    
+                    # Use dedicated RAID 0 single-fragment storage method with encryption
+                    storage_resp = self.storage_module.store_raid0_fragment(base_name, index, total, content_bytes, encryption_key=enc_key)
                     
                     if storage_resp.success:
+                        # Store the encryption key for subsequent fragments
+                        if storage_resp.storage_info and storage_resp.storage_info.get('encryption_key'):
+                            with self._encryption_lock:
+                                self.encryption_keys[base_name] = storage_resp.storage_info['encryption_key']
+                            # Send key to server on first fragment
+                            if index == 1:
+                                try:
+                                    self._send_encryption_key(base_name, storage_resp.storage_info['encryption_key'], interest.user_id or 'system')
+                                except Exception as e:
+                                    print(f"[{self.node_name}] Warning: Could not send encryption key: {e}")
+                        
                         self.stats["files_stored"] += 1
                         self.stats["bytes_stored"] += len(content_bytes)
-                        print(f"[{self.node_name}] ✓ RAID 0: Fragment {index}/{total} stored ({len(content_bytes)} bytes)")
+                        print(f"[{self.node_name}] ✓ RAID 0: Fragment {index}/{total} encrypted and stored ({len(content_bytes)} bytes)")
                         
                         resp_msg = f"STORED:{file_name}"
                         return self._create_data_response(file_name, resp_msg)
@@ -314,15 +348,32 @@ class SimpleStorageNode:
                 if self.raid_level == 5 or '/raid5/' in base_name:
                     print(f"[{self.node_name}] RAID 5: Storing data fragment {index}/{total} immediately")
                     
-                    # Use the same single-fragment storage method as RAID 0
-                    storage_resp = self.storage_module.store_raid0_fragment(base_name, index, total, content_bytes)
+                    # Get or generate encryption key for this file
+                    with self._encryption_lock:
+                        enc_key = self.encryption_keys.get(base_name)
+                    
+                    # Use the same single-fragment storage method as RAID 0 with encryption
+                    storage_resp = self.storage_module.store_raid0_fragment(base_name, index, total, content_bytes, encryption_key=enc_key)
                     
                     if storage_resp.success:
+                        # Store the encryption key for subsequent fragments
+                        if storage_resp.storage_info and storage_resp.storage_info.get('encryption_key'):
+                            with self._encryption_lock:
+                                self.encryption_keys[base_name] = storage_resp.storage_info['encryption_key']
+                            # Send key to server on first fragment
+                            if index == 1:
+                                try:
+                                    self._send_encryption_key(base_name, storage_resp.storage_info['encryption_key'], interest.user_id or 'system')
+                                except Exception as e:
+                                    print(f"[{self.node_name}] Warning: Could not send encryption key: {e}")
+                        
                         self.stats["files_stored"] += 1
                         self.stats["bytes_stored"] += len(content_bytes)
-                        print(f"[{self.node_name}] ✓ RAID 5: Fragment {index}/{total} stored ({len(content_bytes)} bytes)")
+                        print(f"[{self.node_name}] ✓ RAID 5: Fragment {index}/{total} encrypted and stored ({len(content_bytes)} bytes)")
                         
-                        resp_msg = f"STORED:{file_name}"
+                        # Include encryption key in response so router can encrypt parity
+                        resp_enc_key = storage_resp.storage_info.get('encryption_key', '')
+                        resp_msg = f"STORED:{file_name}:enc_key={resp_enc_key}"
                         return self._create_data_response(file_name, resp_msg)
                     else:
                         print(f"[{self.node_name}] ✗ RAID 5: Fragment store failed: {storage_resp.error}")
@@ -333,15 +384,32 @@ class SimpleStorageNode:
                 if self.raid_level == 6 or '/raid6/' in base_name:
                     print(f"[{self.node_name}] RAID 6: Storing data fragment {index}/{total} immediately")
                     
-                    # Use the same single-fragment storage method as RAID 0/5
-                    storage_resp = self.storage_module.store_raid0_fragment(base_name, index, total, content_bytes)
+                    # Get or generate encryption key for this file
+                    with self._encryption_lock:
+                        enc_key = self.encryption_keys.get(base_name)
+                    
+                    # Use the same single-fragment storage method as RAID 0/5 with encryption
+                    storage_resp = self.storage_module.store_raid0_fragment(base_name, index, total, content_bytes, encryption_key=enc_key)
                     
                     if storage_resp.success:
+                        # Store the encryption key for subsequent fragments
+                        if storage_resp.storage_info and storage_resp.storage_info.get('encryption_key'):
+                            with self._encryption_lock:
+                                self.encryption_keys[base_name] = storage_resp.storage_info['encryption_key']
+                            # Send key to server on first fragment
+                            if index == 1:
+                                try:
+                                    self._send_encryption_key(base_name, storage_resp.storage_info['encryption_key'], interest.user_id or 'system')
+                                except Exception as e:
+                                    print(f"[{self.node_name}] Warning: Could not send encryption key: {e}")
+                        
                         self.stats["files_stored"] += 1
                         self.stats["bytes_stored"] += len(content_bytes)
-                        print(f"[{self.node_name}] ✓ RAID 6: Fragment {index}/{total} stored ({len(content_bytes)} bytes)")
+                        print(f"[{self.node_name}] ✓ RAID 6: Fragment {index}/{total} encrypted and stored ({len(content_bytes)} bytes)")
                         
-                        resp_msg = f"STORED:{file_name}"
+                        # Include encryption key in response so router can encrypt parity
+                        resp_enc_key = storage_resp.storage_info.get('encryption_key', '')
+                        resp_msg = f"STORED:{file_name}:enc_key={resp_enc_key}"
                         return self._create_data_response(file_name, resp_msg)
                     else:
                         print(f"[{self.node_name}] ✗ RAID 6: Fragment store failed: {storage_resp.error}")
@@ -368,13 +436,19 @@ class SimpleStorageNode:
                         del self.fragment_accumulator[base_name]
 
                         if storage_resp.success:
+                            # Get encryption key from storage response
+                            encryption_key = None
+                            if storage_resp.storage_info and storage_resp.storage_info.get('encryption_key'):
+                                encryption_key = storage_resp.storage_info['encryption_key']
+                            
                             self.stored_files[base_name] = {
                                 "content": b'',  # Don't store full content in memory
                                 "stored_at": time.strftime('%Y-%m-%d %H:%M:%S'),
                                 "checksum": storage_resp.metadata.checksum if storage_resp.metadata else "",
                                 "size": total_size,
                                 "user": uploader if uploader else "uploader",
-                                "raid_processed": True
+                                "raid_processed": True,
+                                "encryption_key": encryption_key
                             }
                             self.stats["files_stored"] += 1
                             self.stats["bytes_stored"] += total_size
@@ -400,7 +474,9 @@ class SimpleStorageNode:
                                     "size": total_size,
                                     "stored_at": time.strftime('%Y-%m-%d %H:%M:%S'),
                                     "user": uploader if uploader else "system",
-                                    "fragments": fragments_map  # Fragment paths for reassembly on restart
+                                    "fragments": fragments_map,  # Fragment paths for reassembly on restart
+                                    "encryption_key": encryption_key,
+                                    "is_encrypted": True if encryption_key else False
                                 }
                                 with open(meta_path, 'w', encoding='utf-8') as mf:
                                     json.dump(meta, mf, indent=2)
@@ -426,6 +502,13 @@ class SimpleStorageNode:
                                     self._register_location(base_name, sp, owner=uploader)
                                 except Exception as e:
                                     print(f"[{self.node_name}] Warning: could not register location for {base_name}: {e}")
+                                # Send encryption key to server
+                                if encryption_key:
+                                    try:
+                                        self._send_encryption_key(base_name, encryption_key, uploader or 'system')
+                                        print(f"[{self.node_name}] ✓ Encryption key sent to server for {base_name}")
+                                    except Exception as e:
+                                        print(f"[{self.node_name}] Warning: could not send encryption key: {e}")
                             
                             reg_thread = threading.Thread(target=_do_registration, daemon=True)
                             reg_thread.start()
@@ -1175,7 +1258,11 @@ RAID Level: {self.raid_level}"""
                 'node_name': self.node_name,
                 'cleared_files': cleared_files
             }
-            resp = self.comm_module.send_packet_sync('127.0.0.1', 7001, json.dumps(clear_payload))
+            if _USE_NETWORK_CONFIG:
+                srv_host, srv_port = get_server_address()
+            else:
+                srv_host, srv_port = DEFAULT_HOST, 7001
+            resp = self.comm_module.send_packet_sync(srv_host, srv_port, json.dumps(clear_payload))
             if resp:
                 print(f"[{self.node_name}] Notified server to clear {len(cleared_files)} file records")
         except Exception as e:
@@ -1447,8 +1534,10 @@ RAID Level: {self.raid_level}"""
             "raid_level": self.raid_level
         }
         
-        server_host = '127.0.0.1'
-        server_port = 7001
+        if _USE_NETWORK_CONFIG:
+            server_host, server_port = get_server_address()
+        else:
+            server_host, server_port = DEFAULT_HOST, 7001
         
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1553,10 +1642,19 @@ RAID Level: {self.raid_level}"""
         except Exception as e:
             print(f"[{self.node_name}] Warning: Could not register file location via {target_host}:{target_port}: {e}")
 
-    def _sync_local_files_on_startup(self, server_host: str = '127.0.0.1', server_port: int = 7001):
+    def _sync_local_files_on_startup(self, server_host: str = None, server_port: int = None):
         """Scan on-disk metadata files and re-register each local file with the auth server/DB.
         Also rehydrate in-memory self.stored_files so interactive commands work after restart.
         """
+        # Use network config defaults if not specified
+        if server_host is None or server_port is None:
+            if _USE_NETWORK_CONFIG:
+                default_srv_host, default_srv_port = get_server_address()
+            else:
+                default_srv_host, default_srv_port = DEFAULT_HOST, 7001
+            server_host = server_host or default_srv_host
+            server_port = server_port or default_srv_port
+        
         meta_dir = os.path.join(self.storage_path, 'metadata')
         if not os.path.isdir(meta_dir):
             return
